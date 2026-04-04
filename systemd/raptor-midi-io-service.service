@@ -1,0 +1,16 @@
+[Unit]
+Description=Raptor MIDI I/O Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/raptor-midi-io-service /etc/raptor-midi-io-service/raptor-midi-io-service.yaml
+Restart=always
+RestartSec=1
+RuntimeDirectory=raptor-midi-io
+RuntimeDirectoryMode=0755
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

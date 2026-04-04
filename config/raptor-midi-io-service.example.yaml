@@ -1,0 +1,35 @@
+ipc_config_path: /etc/raptor/raptor-ipc.yaml
+
+logging:
+  level: debug
+
+queue:
+  max_events_per_bus: 256
+  warning_threshold_percent: 75
+  overflow_policy: drop_oldest
+
+modules:
+  - id: esp-a
+    spi_device: /dev/spidev0.0
+    spi_speed_hz: 1000000
+    spi_mode: 0
+    chip_select_gpio: 17
+    handshake_gpio: 23
+    handshake_active_low: false
+    max_frame_bytes: 64
+    midi_port_count: 2
+
+  - id: esp-b
+    spi_device: /dev/spidev0.0
+    spi_speed_hz: 1000000
+    spi_mode: 0
+    chip_select_gpio: 27
+    handshake_gpio: 24
+    handshake_active_low: false
+    max_frame_bytes: 64
+    midi_port_count: 3
+
+usb_midi_controllers:
+  - id: x-touch-mini-a
+    match_name: X-TOUCH MINI
+    enabled: true
