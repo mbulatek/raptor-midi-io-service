@@ -1,8 +1,9 @@
-﻿#pragma once
+#pragma once
 
 #include "raptor_midi_io/config.hpp"
 #include "raptor_midi_io/event_bus.hpp"
 
+#include <cstddef>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -14,6 +15,7 @@ public:
     using PacketCallback = std::function<void(MidiPacket)>;
 
     UsbMidiInput(const std::vector<UsbMidiControllerConfig>& controllers,
+                 std::size_t first_usb_global_port,
                  std::atomic<std::uint64_t>& sequence_counter,
                  PacketCallback callback);
     ~UsbMidiInput();
