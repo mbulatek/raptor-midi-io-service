@@ -24,6 +24,7 @@ using json = nlohmann::json;
 constexpr char kSchemaVersion[] = "1.0";
 constexpr char kServiceName[] = "raptor-midi-io-service";
 constexpr char kTopic[] = "midi.packet";
+constexpr char kStatsTopic[] = "midi.io.stats";
 
 std::string format_bytes(const std::vector<std::uint8_t>& bytes) {
     std::ostringstream out;
@@ -78,6 +79,18 @@ json encode_packet_json(const MidiPacket& packet) {
     };
 }
 
+
+json encode_stats_json(const MidiIoStats& stats) {
+    return {
+        {"schema_version", kSchemaVersion},
+        {"service", kServiceName},
+        {"type", "midi.io.stats"},
+        {"timestamp_ns", monotonic_time_ns()},
+        {"spi_invalid_port_drops_total", stats.spi_invalid_port_drops_total},
+        {"bus_queue_dropped_events_total", stats.bus_queue_dropped_events_total},
+        {"usb_queue_dropped_events_total", stats.usb_queue_dropped_events_total},
+    };
+}
 std::filesystem::path endpoint_directory(const std::string& endpoint) {
     constexpr std::string_view prefix {"ipc://"};
     if (!endpoint.starts_with(prefix)) {
@@ -161,7 +174,7 @@ void EventBus::publish(const MidiPacket& packet) {
         const auto send_payload = zmq_send(impl_->publisher, json.data(), json.size(), 0);
 
         if (send_topic >= 0 && send_payload >= 0) {
-            spdlog::debug("publish endpoint={} seq={} source_kind={} bytes={}", events_endpoint_, packet.sequence, packet.source_kind, packet.bytes.size());
+            spdlog::trace("publish endpoint={} seq={} source_kind={} bytes={}", events_endpoint_, packet.sequence, packet.source_kind, packet.bytes.size());
             return;
         }
 
@@ -185,4 +198,29 @@ void EventBus::publish(const MidiPacket& packet) {
     );
 }
 
+
+void EventBus::publish_stats(const MidiIoStats& stats) {
+#if RAPTOR_MIDI_IO_HAS_ZEROMQ
+    if (impl_ && impl_->publisher != nullptr) {
+        const auto json = encode_stats_json(stats).dump();
+        const auto send_topic = zmq_send(impl_->publisher, kStatsTopic, sizeof(kStatsTopic) - 1, ZMQ_SNDMORE);
+        const auto send_payload = zmq_send(impl_->publisher, json.data(), json.size(), 0);
+
+        if (send_topic >= 0 && send_payload >= 0) {
+            return;
+        }
+
+        spdlog::error("ZeroMQ publish stats failed on {}: {}", events_endpoint_, zmq_strerror(zmq_errno()));
+        return;
+    }
+#endif
+
+    // When ZeroMQ isn't available, stats are only visible via logs.
+    spdlog::trace(
+        "publish stats endpoint={} spi_invalid_port_drops_total={} bus_queue_dropped_events_total={} usb_queue_dropped_events_total={}",
+        events_endpoint_,
+        stats.spi_invalid_port_drops_total,
+        stats.bus_queue_dropped_events_total,
+        stats.usb_queue_dropped_events_total);
+}
 }  // namespace raptor::midi_io

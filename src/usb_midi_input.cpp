@@ -15,6 +15,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 namespace raptor::midi_io {
 namespace {
@@ -27,6 +28,7 @@ struct ConnectedPort {
     int port_id {0};
     std::string client_name;
     std::string port_name;
+    std::size_t global_port {0};
 };
 
 bool contains_case_insensitive(const std::string& haystack, const std::string& needle) {
@@ -71,11 +73,22 @@ std::vector<std::uint8_t> midi_bytes_from_event(const snd_seq_event_t& event) {
 
 struct UsbMidiInput::Impl {
     Impl(const std::vector<UsbMidiControllerConfig>& configured_controllers,
+         std::size_t first_usb_global_port_in,
          std::atomic<std::uint64_t>& sequence,
          PacketCallback packet_callback)
         : controllers(configured_controllers),
+          first_usb_global_port(first_usb_global_port_in),
           sequence_counter(sequence),
-          callback(std::move(packet_callback)) {}
+          callback(std::move(packet_callback)) {
+        std::size_t next = first_usb_global_port;
+        for (const auto& c : controllers) {
+            if (!c.enabled) {
+                continue;
+            }
+            (void)global_port_by_controller_id.emplace(c.id, next);
+            ++next;
+        }
+    }
 
     void open_seq() {
         if (seq != nullptr) {
@@ -141,13 +154,17 @@ struct UsbMidiInput::Impl {
                         continue;
                     }
 
-                    spdlog::debug("USB MIDI connect controller={} match=""{}"" alsa=""{}:{}""", controller.id, controller.match_name, client_name, port_name);
+                    const auto g_it = global_port_by_controller_id.find(controller.id);
+                    const std::size_t global_port = (g_it == global_port_by_controller_id.end()) ? 0 : g_it->second;
+
+                    spdlog::debug("USB MIDI connect controller={} match=\"\"{}\"\" port={} alsa=\"\"{}:{}\"\"", controller.id, controller.match_name, global_port, client_name, port_name);
                     connected_ports.push_back(ConnectedPort {
                         .config = controller,
                         .client_id = client,
                         .port_id = snd_seq_port_info_get_port(port_info),
                         .client_name = client_name,
                         .port_name = port_name,
+                        .global_port = global_port,
                     });
                 }
             }
@@ -183,10 +200,10 @@ struct UsbMidiInput::Impl {
                 packet.controller_id = it->config.id;
                 packet.device_name = it->client_name + ":" + it->port_name;
                 packet.module_port_count = 1;
-                packet.module_first_global_port = 0;
-                packet.module_last_global_port = 0;
+                packet.module_first_global_port = it->global_port;
+                packet.module_last_global_port = it->global_port;
                 packet.local_port = 1;
-                packet.global_port = 0;
+                packet.global_port = it->global_port;
                 packet.bytes = bytes;
                 packet.sequence = sequence_counter.fetch_add(1, std::memory_order_relaxed) + 1;
 
@@ -225,6 +242,8 @@ struct UsbMidiInput::Impl {
         connected_ports.clear();
     }
 
+    std::size_t first_usb_global_port {1};
+    std::unordered_map<std::string, std::size_t> global_port_by_controller_id;
     std::vector<UsbMidiControllerConfig> controllers;
     std::vector<ConnectedPort> connected_ports;
     std::atomic<std::uint64_t>& sequence_counter;
@@ -236,9 +255,10 @@ struct UsbMidiInput::Impl {
 };
 
 UsbMidiInput::UsbMidiInput(const std::vector<UsbMidiControllerConfig>& controllers,
+                           std::size_t first_usb_global_port,
                            std::atomic<std::uint64_t>& sequence_counter,
                            PacketCallback callback)
-    : impl_(std::make_unique<Impl>(controllers, sequence_counter, std::move(callback))) {}
+    : impl_(std::make_unique<Impl>(controllers, first_usb_global_port, sequence_counter, std::move(callback))) {}
 
 UsbMidiInput::~UsbMidiInput() {
     stop();

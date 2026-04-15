@@ -1,4 +1,4 @@
-﻿#include "raptor_midi_io/io_loop.hpp"
+#include "raptor_midi_io/io_loop.hpp"
 
 #include "raptor_midi_io/event_bus.hpp"
 #include "raptor_midi_io/gpio_manager.hpp"
@@ -21,6 +21,19 @@
 #include <spdlog/spdlog.h>
 
 namespace raptor::midi_io {
+
+namespace {
+
+std::size_t first_usb_global_port(const ServiceConfig& cfg) {
+    std::size_t next = 1;
+    for (const auto& m : cfg.modules) {
+        next = m.last_global_midi_port + 1;
+    }
+    return next;
+}
+
+}  // namespace
+
 
 struct IoLoop::Impl {
     struct PublishedItem {
@@ -46,7 +59,7 @@ struct IoLoop::Impl {
         : config(service_config),
           published_packets(published_count),
           sequence_counter(sequence_count),
-          usb_midi_input(config.usb_midi_controllers, sequence_counter, [this](MidiPacket packet) {
+          usb_midi_input(config.usb_midi_controllers, first_usb_global_port(config), sequence_counter, [this](MidiPacket packet) {
               enqueue_locked(std::move(packet), usb_queue, usb_queue_high_watermark, usb_dropped_events);
               queue_cv.notify_one();
           }) {}
@@ -102,11 +115,9 @@ struct IoLoop::Impl {
                     }
 
                     if (read_result.local_port < 1 || read_result.local_port > triggered.midi_port_count) {
-                        spdlog::debug(
-                            "spi packet dropped invalid local_port={} module={} configured_ports={}",
-                            read_result.local_port,
-                            triggered.id,
-                            triggered.midi_port_count);
+                        spi_invalid_port_drops_total.fetch_add(1, std::memory_order_relaxed);
+                        // Wake publisher loop so it can publish updated stats even if nothing was enqueued.
+                        queue_cv.notify_one();
                         return;
                     }
 
@@ -164,51 +175,85 @@ struct IoLoop::Impl {
         });
     }
 
-    void publisher_loop() {
+        void publisher_loop() {
         EventBus bus {config.ipc.events_endpoint};
         spdlog::debug("io publisher start endpoint={}", config.ipc.events_endpoint);
         std::size_t next_bus_index = 0;
 
-        while (true) {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            queue_cv.wait(lock, [&]() {
-                return stop_requested.load(std::memory_order_relaxed) || has_pending_items_locked();
-            });
+        MidiIoStats last_stats;
+        bool last_stats_valid = false;
+        auto last_stats_pub_at = std::chrono::steady_clock::now();
 
-            if (stop_requested.load(std::memory_order_relaxed) && !has_pending_items_locked()) {
-                break;
-            }
-
+        for (;;) {
             PublishedItem item;
             bool found = false;
+            bool should_stop = false;
 
-            if (!usb_queue.empty()) {
-                item = std::move(usb_queue.front());
-                usb_queue.pop_front();
-                found = true;
-            } else {
-                for (std::size_t i = 0; i < bus_workers.size(); ++i) {
-                    const auto index = (next_bus_index + i) % bus_workers.size();
-                    auto& worker = bus_workers[index];
-                    if (worker.queue.empty()) {
-                        continue;
-                    }
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                (void)queue_cv.wait_for(lock, std::chrono::milliseconds(200), [&]() {
+                    return stop_requested.load(std::memory_order_relaxed) || has_pending_items_locked();
+                });
 
-                    item = std::move(worker.queue.front());
-                    worker.queue.pop_front();
-                    next_bus_index = (index + 1) % bus_workers.size();
+                should_stop = stop_requested.load(std::memory_order_relaxed) && !has_pending_items_locked();
+
+                if (!usb_queue.empty()) {
+                    item = std::move(usb_queue.front());
+                    usb_queue.pop_front();
                     found = true;
-                    break;
+                } else {
+                    for (std::size_t i = 0; i < bus_workers.size(); ++i) {
+                        const auto index = (next_bus_index + i) % bus_workers.size();
+                        auto& worker = bus_workers[index];
+                        if (worker.queue.empty()) {
+                            continue;
+                        }
+
+                        item = std::move(worker.queue.front());
+                        worker.queue.pop_front();
+                        next_bus_index = (index + 1) % bus_workers.size();
+                        found = true;
+                        break;
+                    }
                 }
             }
-            lock.unlock();
 
-            if (!found) {
+            // Publish stats periodically or when they change.
+            MidiIoStats stats;
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                stats.spi_invalid_port_drops_total = spi_invalid_port_drops_total.load(std::memory_order_relaxed);
+                stats.usb_queue_dropped_events_total = usb_dropped_events;
+                std::uint64_t bus_drops = 0;
+                for (const auto& w : bus_workers) {
+                    bus_drops += w.dropped_events;
+                }
+                stats.bus_queue_dropped_events_total = bus_drops;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const bool changed =
+                !last_stats_valid ||
+                stats.spi_invalid_port_drops_total != last_stats.spi_invalid_port_drops_total ||
+                stats.bus_queue_dropped_events_total != last_stats.bus_queue_dropped_events_total ||
+                stats.usb_queue_dropped_events_total != last_stats.usb_queue_dropped_events_total;
+
+            if (!last_stats_valid || changed || (now - last_stats_pub_at) > std::chrono::seconds(1)) {
+                bus.publish_stats(stats);
+                last_stats = stats;
+                last_stats_valid = true;
+                last_stats_pub_at = now;
+            }
+
+            if (found) {
+                bus.publish(item.packet);
+                published_packets.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
-            bus.publish(item.packet);
-            published_packets.fetch_add(1, std::memory_order_relaxed);
+            if (should_stop) {
+                break;
+            }
         }
 
         spdlog::debug("io publisher stopped");
@@ -344,6 +389,8 @@ struct IoLoop::Impl {
     ServiceConfig config;
     std::atomic<std::uint64_t>& published_packets;
     std::atomic<std::uint64_t>& sequence_counter;
+    std::atomic<std::uint64_t> spi_invalid_port_drops_total {0};
+
     UsbMidiInput usb_midi_input;
     std::atomic<bool> stop_requested {false};
     mutable std::mutex queue_mutex;

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <cstdint>
 #include <memory>
@@ -27,6 +27,15 @@ struct MidiPacket {
     std::uint64_t sequence {0};
 };
 
+struct MidiIoStats {
+    // Drops of decoded SPI frames where local_port is outside the module's configured port range.
+    std::uint64_t spi_invalid_port_drops_total {0};
+
+    // Drops due to internal queue overflows (data arrived but could not be queued for publish).
+    std::uint64_t bus_queue_dropped_events_total {0};
+    std::uint64_t usb_queue_dropped_events_total {0};
+};
+
 class EventBus {
 public:
     explicit EventBus(std::string events_endpoint);
@@ -38,6 +47,7 @@ public:
     EventBus& operator=(EventBus&&) noexcept;
 
     void publish(const MidiPacket& packet);
+    void publish_stats(const MidiIoStats& stats);
 
 private:
     struct Impl;

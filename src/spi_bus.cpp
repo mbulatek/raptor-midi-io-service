@@ -1,8 +1,11 @@
-﻿#include "raptor_midi_io/spi_bus.hpp"
+#include "raptor_midi_io/spi_bus.hpp"
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <chrono>
+#include <unordered_map>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -36,6 +39,27 @@ static std::string hex_dump(const std::vector<std::uint8_t>& bytes) {
     }
     return out;
 }
+
+static std::string hex_dump_prefix(const std::vector<std::uint8_t>& bytes, std::size_t max_bytes) {
+    const std::size_t n = std::min<std::size_t>(max_bytes, bytes.size());
+    std::string out;
+    out.reserve(n * 3 + 6);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i) {
+            out.push_back(' ');
+        }
+        out += fmt::format("{:02X}", bytes[i]);
+    }
+    if (bytes.size() > n) {
+        out += " ...";
+    }
+    return out;
+}
+
+struct InvalidPortStats {
+    std::uint64_t count {0};
+    std::chrono::steady_clock::time_point last_log {};
+};
 SpiReadResult decode_payload(std::vector<std::uint8_t> payload) {
     if (payload.empty()) {
         return {};
@@ -246,7 +270,7 @@ SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
     }
 
     std::vector<std::uint8_t> tx(module.max_frame_bytes, 0x00);
-    spdlog::debug("spi read module={} dev={} speed_hz={} mode={} frame_bytes={} cs_gpio={}", module.id, module.spi_device, speed, static_cast<int>(mode), module.max_frame_bytes, module.chip_select_gpio);
+    spdlog::trace("spi read module={} dev={} speed_hz={} mode={} frame_bytes={} cs_gpio={}", module.id, module.spi_device, speed, static_cast<int>(mode), module.max_frame_bytes, module.chip_select_gpio);
     std::vector<std::uint8_t> rx(module.max_frame_bytes, 0x00);
 
     ::spi_ioc_transfer transfer {};
@@ -274,15 +298,33 @@ SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
     const auto raw_rx = rx;
     auto decoded = decode_payload(std::move(rx));
     if (!decoded.bytes.empty() && (decoded.local_port < 1 || decoded.local_port > module.midi_port_count)) {
-        spdlog::warn(
-            "spi rx invalid local_port={} module={} configured_ports={} raw_rx=[{}]",
-            decoded.local_port,
-            module.id,
-            module.midi_port_count,
-            hex_dump(raw_rx));
+        // When SPI wiring is noisy, we can get garbage frames that still look non-empty after decode.
+        // Logging the full raw buffer on every frame can block the service (journald backpressure).
+        thread_local std::unordered_map<std::string, InvalidPortStats> stats;
+        auto& st = stats[module.id];
+        ++st.count;
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool log_now =
+            (st.count <= 5) ||
+            (st.count % 200 == 0) ||
+            (st.last_log.time_since_epoch().count() == 0) ||
+            (now - st.last_log) > std::chrono::seconds(2);
+
+        if (log_now) {
+            st.last_log = now;
+            spdlog::warn(
+                "spi rx invalid local_port={} module={} configured_ports={} invalid_count={} raw_rx=[{}]",
+                decoded.local_port,
+                module.id,
+                module.midi_port_count,
+                st.count,
+                hex_dump_prefix(raw_rx, 24));
+        }
     }
+
     if (!decoded.bytes.empty()) {
-        spdlog::debug("spi rx module={} local_port={} bytes={}", module.id, decoded.local_port, decoded.bytes.size());
+        spdlog::trace("spi rx module={} local_port={} bytes={}", module.id, decoded.local_port, decoded.bytes.size());
     }
     return decoded;
 #else
