@@ -34,6 +34,11 @@ struct MidiIoStats {
     // Drops due to internal queue overflows (data arrived but could not be queued for publish).
     std::uint64_t bus_queue_dropped_events_total {0};
     std::uint64_t usb_queue_dropped_events_total {0};
+
+    // Downstream SPI TX health.
+    std::uint64_t output_queue_dropped_events_total {0};
+    std::uint64_t output_sent_events_total {0};
+    std::uint64_t output_failed_events_total {0};
 };
 
 class EventBus {

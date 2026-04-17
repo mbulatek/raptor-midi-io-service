@@ -40,14 +40,27 @@ struct IoLoop::Impl {
         MidiPacket packet;
     };
 
+    struct OutboundItem {
+        std::size_t module_index {0};
+        std::size_t local_port {1};
+        std::size_t global_port {0};
+        std::vector<std::uint8_t> bytes;
+        std::uint64_t sequence {0};
+    };
+
     struct BusWorker {
         std::string bus_key;
         std::vector<ModuleConfig> modules;
         std::deque<PublishedItem> queue;
+        std::deque<OutboundItem> output_queue;
         std::size_t queue_capacity {0};
         std::size_t warning_threshold {0};
         std::size_t queue_high_watermark {0};
         std::uint64_t dropped_events {0};
+        std::size_t output_queue_high_watermark {0};
+        std::uint64_t output_dropped_events {0};
+        std::uint64_t output_sent_events {0};
+        std::uint64_t output_failed_events {0};
         GpioManager gpio;
         SpiBus spi;
         std::thread worker;
@@ -103,6 +116,67 @@ struct IoLoop::Impl {
         if (queue.size() > high_watermark) {
             high_watermark = queue.size();
         }
+    }
+
+    bool enqueue_output(std::size_t global_port, std::vector<std::uint8_t> bytes, std::string& error) {
+        if (global_port == 0) {
+            error = "global_port must be >= 1";
+            return false;
+        }
+        if (bytes.empty() || bytes.size() > 3) {
+            error = "bytes must have 1..3 MIDI bytes";
+            return false;
+        }
+        if ((bytes[0] & 0x80) == 0) {
+            error = "first byte must be a MIDI status byte (>= 0x80)";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(queue_mutex);
+
+        for (auto& worker : bus_workers) {
+            for (std::size_t module_index = 0; module_index < worker.modules.size(); ++module_index) {
+                const auto& module = worker.modules[module_index];
+                if (global_port < module.first_global_midi_port || global_port > module.last_global_midi_port) {
+                    continue;
+                }
+
+                const auto local_port = (global_port - module.first_global_midi_port) + 1;
+                if (local_port < 1 || local_port > module.midi_port_count) {
+                    error = "resolved local_port out of configured module range";
+                    return false;
+                }
+
+                if (worker.queue_capacity > 0 && worker.output_queue.size() >= worker.queue_capacity) {
+                    worker.output_queue.pop_front();
+                    ++worker.output_dropped_events;
+                    if (worker.output_dropped_events == 1 || (worker.output_dropped_events % 100) == 0) {
+                        spdlog::warn(
+                            "bus output queue overflow bus={} dropped_events={} capacity={}",
+                            worker.bus_key,
+                            worker.output_dropped_events,
+                            worker.queue_capacity);
+                    }
+                }
+
+                const auto sequence = sequence_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+                worker.output_queue.push_back(OutboundItem {
+                    .module_index = module_index,
+                    .local_port = local_port,
+                    .global_port = global_port,
+                    .bytes = std::move(bytes),
+                    .sequence = sequence,
+                });
+                if (worker.output_queue.size() > worker.output_queue_high_watermark) {
+                    worker.output_queue_high_watermark = worker.output_queue.size();
+                }
+                queue_cv.notify_one();
+                return true;
+            }
+        }
+
+        error = "no module route for global_port=" + std::to_string(global_port);
+        return false;
     }
 
     void start_bus_worker(BusWorker& worker) {
@@ -168,14 +242,72 @@ struct IoLoop::Impl {
                 });
             }
 
-            while (!stop_requested.load(std::memory_order_relaxed)) {
+            for (;;) {
+                OutboundItem outbound;
+                bool have_outbound = false;
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    if (!worker.output_queue.empty()) {
+                        outbound = std::move(worker.output_queue.front());
+                        worker.output_queue.pop_front();
+                        have_outbound = true;
+                    }
+                }
+
+                if (have_outbound) {
+                    bool sent = false;
+                    if (outbound.module_index < worker.modules.size()) {
+                        const auto& module = worker.modules[outbound.module_index];
+                        sent = worker.spi.write_packet(module, outbound.local_port, outbound.bytes);
+                        if (!sent) {
+                            spdlog::warn(
+                                "spi tx failed bus={} module={} global_port={} local_port={} bytes={} seq={}",
+                                worker.bus_key,
+                                module.id,
+                                outbound.global_port,
+                                outbound.local_port,
+                                outbound.bytes.size(),
+                                outbound.sequence);
+                        } else {
+                            spdlog::debug(
+                                "spi tx bus={} module={} global_port={} local_port={} bytes={} seq={}",
+                                worker.bus_key,
+                                module.id,
+                                outbound.global_port,
+                                outbound.local_port,
+                                outbound.bytes.size(),
+                                outbound.sequence);
+                        }
+                    } else {
+                        spdlog::warn(
+                            "spi tx failed bus={} invalid module index={} seq={}",
+                            worker.bus_key,
+                            outbound.module_index,
+                            outbound.sequence);
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex);
+                        if (sent) {
+                            ++worker.output_sent_events;
+                        } else {
+                            ++worker.output_failed_events;
+                        }
+                    }
+                    continue;
+                }
+
+                if (stop_requested.load(std::memory_order_relaxed)) {
+                    break;
+                }
+
                 worker.gpio.run_once();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         });
     }
 
-        void publisher_loop() {
+    void publisher_loop() {
         EventBus bus {config.ipc.events_endpoint};
         spdlog::debug("io publisher start endpoint={}", config.ipc.events_endpoint);
         std::size_t next_bus_index = 0;
@@ -225,10 +357,19 @@ struct IoLoop::Impl {
                 stats.spi_invalid_port_drops_total = spi_invalid_port_drops_total.load(std::memory_order_relaxed);
                 stats.usb_queue_dropped_events_total = usb_dropped_events;
                 std::uint64_t bus_drops = 0;
+                std::uint64_t out_drops = 0;
+                std::uint64_t out_sent = 0;
+                std::uint64_t out_failed = 0;
                 for (const auto& w : bus_workers) {
                     bus_drops += w.dropped_events;
+                    out_drops += w.output_dropped_events;
+                    out_sent += w.output_sent_events;
+                    out_failed += w.output_failed_events;
                 }
                 stats.bus_queue_dropped_events_total = bus_drops;
+                stats.output_queue_dropped_events_total = out_drops;
+                stats.output_sent_events_total = out_sent;
+                stats.output_failed_events_total = out_failed;
             }
 
             const auto now = std::chrono::steady_clock::now();
@@ -236,7 +377,10 @@ struct IoLoop::Impl {
                 !last_stats_valid ||
                 stats.spi_invalid_port_drops_total != last_stats.spi_invalid_port_drops_total ||
                 stats.bus_queue_dropped_events_total != last_stats.bus_queue_dropped_events_total ||
-                stats.usb_queue_dropped_events_total != last_stats.usb_queue_dropped_events_total;
+                stats.usb_queue_dropped_events_total != last_stats.usb_queue_dropped_events_total ||
+                stats.output_queue_dropped_events_total != last_stats.output_queue_dropped_events_total ||
+                stats.output_sent_events_total != last_stats.output_sent_events_total ||
+                stats.output_failed_events_total != last_stats.output_failed_events_total;
 
             if (!last_stats_valid || changed || (now - last_stats_pub_at) > std::chrono::seconds(1)) {
                 bus.publish_stats(stats);
@@ -330,12 +474,18 @@ struct IoLoop::Impl {
             publisher.join();
         }
         for (const auto& w : bus_workers) {
-            if (w.dropped_events > 0 || w.queue_high_watermark > 0) {
+            if (w.dropped_events > 0 || w.queue_high_watermark > 0 ||
+                w.output_dropped_events > 0 || w.output_queue_high_watermark > 0 ||
+                w.output_sent_events > 0 || w.output_failed_events > 0) {
                 spdlog::debug(
-                    "io stop bus={} dropped_events={} high_watermark={}",
+                    "io stop bus={} dropped_events={} high_watermark={} out_dropped={} out_high_watermark={} out_sent={} out_failed={}",
                     w.bus_key,
                     w.dropped_events,
-                    w.queue_high_watermark);
+                    w.queue_high_watermark,
+                    w.output_dropped_events,
+                    w.output_queue_high_watermark,
+                    w.output_sent_events,
+                    w.output_failed_events);
             }
         }
         if (usb_dropped_events > 0 || usb_queue_high_watermark > 0) {
@@ -353,6 +503,10 @@ struct IoLoop::Impl {
         queue_cv.notify_one();
     }
 
+    bool send_midi(std::size_t global_port, std::vector<std::uint8_t> bytes, std::string& error) {
+        return enqueue_output(global_port, std::move(bytes), error);
+    }
+
     IoMetrics snapshot() const {
         std::lock_guard<std::mutex> lock(queue_mutex);
 
@@ -368,11 +522,20 @@ struct IoLoop::Impl {
                 .queue_capacity = config.queue.max_events_per_bus,
                 .queue_high_watermark = usb_queue_high_watermark,
                 .dropped_events = usb_dropped_events,
+                .output_queue_depth = 0,
+                .output_queue_capacity = config.queue.max_events_per_bus,
+                .output_queue_high_watermark = 0,
+                .output_dropped_events = 0,
+                .output_sent_events = 0,
+                .output_failed_events = 0,
             });
         }
 
         for (const auto& worker : bus_workers) {
             metrics.dropped_events_total += worker.dropped_events;
+            metrics.output_dropped_events_total += worker.output_dropped_events;
+            metrics.output_sent_events_total += worker.output_sent_events;
+            metrics.output_failed_events_total += worker.output_failed_events;
             metrics.buses.push_back(BusIoMetrics {
                 .bus_key = worker.bus_key,
                 .module_count = worker.modules.size(),
@@ -380,6 +543,12 @@ struct IoLoop::Impl {
                 .queue_capacity = worker.queue_capacity,
                 .queue_high_watermark = worker.queue_high_watermark,
                 .dropped_events = worker.dropped_events,
+                .output_queue_depth = worker.output_queue.size(),
+                .output_queue_capacity = worker.queue_capacity,
+                .output_queue_high_watermark = worker.output_queue_high_watermark,
+                .output_dropped_events = worker.output_dropped_events,
+                .output_sent_events = worker.output_sent_events,
+                .output_failed_events = worker.output_failed_events,
             });
         }
 
@@ -430,6 +599,14 @@ void IoLoop::enqueue(MidiPacket packet) {
     if (impl_) {
         impl_->enqueue(std::move(packet));
     }
+}
+
+bool IoLoop::send_midi(std::size_t global_port, std::vector<std::uint8_t> bytes, std::string& error) {
+    if (!impl_) {
+        error = "io loop not initialized";
+        return false;
+    }
+    return impl_->send_midi(global_port, std::move(bytes), error);
 }
 
 IoMetrics IoLoop::snapshot() const {

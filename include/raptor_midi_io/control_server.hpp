@@ -23,8 +23,13 @@ struct ServiceSnapshot {
 class ControlServer {
 public:
     using ReloadHandler = std::function<bool(std::string& error)>;
+    using SendMidiHandler = std::function<bool(std::size_t global_port, const std::vector<std::uint8_t>& bytes, std::string& error)>;
 
-    ControlServer(std::string control_endpoint, const ServiceConfig& config, ReloadHandler reload_handler = {});
+    ControlServer(
+        std::string control_endpoint,
+        const ServiceConfig& config,
+        ReloadHandler reload_handler = {},
+        SendMidiHandler send_midi_handler = {});
     ~ControlServer();
 
     ControlServer(const ControlServer&) = delete;
@@ -40,6 +45,7 @@ private:
 
     std::string control_endpoint_;
     ReloadHandler reload_handler_ {};
+    SendMidiHandler send_midi_handler_ {};
     const ServiceConfig* config_ {nullptr};
     ServiceSnapshot snapshot_;
     std::unique_ptr<Impl> impl_;

@@ -1,6 +1,7 @@
 #include "raptor_midi_io/spi_bus.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -102,8 +103,11 @@ SpiReadResult decode_payload(std::vector<std::uint8_t> payload) {
             bytes.push_back(payload[19]);
         }
 
+        const auto local_port =
+            (payload.size() > 20 && payload[20] > 0) ? static_cast<std::size_t>(payload[20]) : 1;
+
         return SpiReadResult {
-            .local_port = 1,
+            .local_port = local_port,
             .bytes = std::move(bytes),
         };
     }
@@ -230,32 +234,24 @@ private:
 #endif
 };
 
-#endif
-
-}  // namespace
-
-SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
-#if defined(__linux__)
+bool transfer_frame(const ModuleConfig& module, const std::vector<std::uint8_t>& tx, std::vector<std::uint8_t>& rx) {
     ChipSelectGuard chip_select {module.chip_select_gpio};
     if (!chip_select.ready()) {
         spdlog::warn("failed to prepare chip-select GPIO {}", module.chip_select_gpio);
-        return {};
+        return false;
     }
 
     const int fd = ::open(module.spi_device.c_str(), O_RDWR);
     if (fd < 0) {
         spdlog::warn("failed to open SPI device {}: {}", module.spi_device, std::strerror(errno));
-        return {};
+        return false;
     }
 
     const auto close_fd = [&]() { ::close(fd); };
 
     std::uint8_t mode = module.spi_mode;
-
     if (module.chip_select_gpio >= 0) {
-
         mode |= SPI_NO_CS;
-
     }
     std::uint8_t bits_per_word = 8;
     std::uint32_t speed = module.spi_speed_hz;
@@ -263,15 +259,17 @@ SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
     if (::ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0 ||
         ::ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits_per_word) < 0 ||
         ::ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
-        spdlog::debug("spi cfg failed dev={} mode={} bits={} speed_hz={} err={}", module.spi_device, static_cast<int>(mode), static_cast<int>(bits_per_word), speed, std::strerror(errno));
+        spdlog::debug(
+            "spi cfg failed dev={} mode={} bits={} speed_hz={} err={}",
+            module.spi_device,
+            static_cast<int>(mode),
+            static_cast<int>(bits_per_word),
+            speed,
+            std::strerror(errno));
         spdlog::warn("failed to configure SPI device {}: {}", module.spi_device, std::strerror(errno));
         close_fd();
-        return {};
+        return false;
     }
-
-    std::vector<std::uint8_t> tx(module.max_frame_bytes, 0x00);
-    spdlog::trace("spi read module={} dev={} speed_hz={} mode={} frame_bytes={} cs_gpio={}", module.id, module.spi_device, speed, static_cast<int>(mode), module.max_frame_bytes, module.chip_select_gpio);
-    std::vector<std::uint8_t> rx(module.max_frame_bytes, 0x00);
 
     ::spi_ioc_transfer transfer {};
     transfer.tx_buf = reinterpret_cast<unsigned long>(tx.data());
@@ -283,7 +281,7 @@ SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
     if (!chip_select.set_asserted(true)) {
         spdlog::warn("failed to assert chip-select GPIO {}", module.chip_select_gpio);
         close_fd();
-        return {};
+        return false;
     }
 
     const int result = ::ioctl(fd, SPI_IOC_MESSAGE(1), &transfer);
@@ -292,6 +290,28 @@ SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
 
     if (result < 0) {
         spdlog::warn("SPI transfer failed on {}: {}", module.spi_device, std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+#endif
+
+}  // namespace
+
+SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
+#if defined(__linux__)
+    std::vector<std::uint8_t> tx(module.max_frame_bytes, 0x00);
+    std::vector<std::uint8_t> rx(module.max_frame_bytes, 0x00);
+    spdlog::trace(
+        "spi read module={} dev={} speed_hz={} mode={} frame_bytes={} cs_gpio={}",
+        module.id,
+        module.spi_device,
+        module.spi_speed_hz,
+        static_cast<int>(module.spi_mode),
+        module.max_frame_bytes,
+        module.chip_select_gpio);
+    if (!transfer_frame(module, tx, rx)) {
         return {};
     }
 
@@ -337,6 +357,89 @@ SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
                 0x7F,
             },
     };
+#endif
+}
+
+bool SpiBus::write_packet(const ModuleConfig& module, std::size_t local_port, const std::vector<std::uint8_t>& bytes) {
+#if defined(__linux__)
+    if (bytes.empty() || bytes.size() > 3) {
+        spdlog::warn(
+            "spi tx invalid midi bytes size module={} local_port={} bytes={}",
+            module.id,
+            local_port,
+            bytes.size());
+        return false;
+    }
+
+    if ((bytes[0] & 0x80) == 0) {
+        spdlog::warn(
+            "spi tx invalid status module={} local_port={} status=0x{:02X}",
+            module.id,
+            local_port,
+            static_cast<unsigned int>(bytes[0]));
+        return false;
+    }
+
+    constexpr std::size_t kPacketSize = 24;
+    constexpr std::uint32_t kMagic = 0x4D494449u; // "MIDI"
+    const std::size_t frame_size = std::max<std::size_t>(module.max_frame_bytes, kPacketSize);
+
+    std::vector<std::uint8_t> tx(frame_size, 0x00);
+    std::vector<std::uint8_t> rx(frame_size, 0x00);
+
+    const auto write_u32_le = [&](const std::size_t offset, const std::uint32_t value) {
+        if (offset + 4 > tx.size()) {
+            return;
+        }
+        tx[offset + 0] = static_cast<std::uint8_t>((value >> 0) & 0xFFU);
+        tx[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xFFU);
+        tx[offset + 2] = static_cast<std::uint8_t>((value >> 16) & 0xFFU);
+        tx[offset + 3] = static_cast<std::uint8_t>((value >> 24) & 0xFFU);
+    };
+    const auto write_u64_le = [&](const std::size_t offset, const std::uint64_t value) {
+        if (offset + 8 > tx.size()) {
+            return;
+        }
+        for (std::size_t i = 0; i < 8; ++i) {
+            tx[offset + i] = static_cast<std::uint8_t>((value >> (8 * i)) & 0xFFU);
+        }
+    };
+
+    static std::atomic<std::uint32_t> tx_sequence {0};
+    const auto sequence = tx_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    write_u32_le(0, kMagic);
+    write_u32_le(4, sequence);
+
+    const auto now_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    write_u64_le(8, now_us);
+
+    tx[16] = static_cast<std::uint8_t>(bytes.size());
+    tx[17] = bytes[0];
+    if (bytes.size() > 1) {
+        tx[18] = bytes[1];
+    }
+    if (bytes.size() > 2) {
+        tx[19] = bytes[2];
+    }
+    // Keep local_port in reserved byte for forward compatibility.
+    tx[20] = static_cast<std::uint8_t>(local_port & 0xFFU);
+
+    spdlog::trace(
+        "spi tx module={} local_port={} frame_bytes={} midi=[{}]",
+        module.id,
+        local_port,
+        tx.size(),
+        hex_dump(bytes));
+    return transfer_frame(module, tx, rx);
+#else
+    (void)module;
+    (void)local_port;
+    (void)bytes;
+    return true;
 #endif
 }
 

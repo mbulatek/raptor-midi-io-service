@@ -13,17 +13,17 @@ modules:
     spi_device: /dev/spidev0.0
     spi_speed_hz: 1000000
     spi_mode: 0
-    chip_select_gpio: 17
+    chip_select_gpio: -1
     handshake_gpio: 23
     handshake_active_low: false
     max_frame_bytes: 64
     midi_port_count: 2
 
   - id: esp-b
-    spi_device: /dev/spidev0.0
+    spi_device: /dev/spidev0.1
     spi_speed_hz: 1000000
     spi_mode: 0
-    chip_select_gpio: 27
+    chip_select_gpio: -1
     handshake_gpio: 24
     handshake_active_low: false
     max_frame_bytes: 64

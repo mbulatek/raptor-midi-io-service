@@ -56,8 +56,9 @@ void validate_config(const ServiceConfig& config) {
         if (module.handshake_gpio < 0) {
             throw std::runtime_error("module " + module.id + " must define handshake_gpio");
         }
-        if (module.chip_select_gpio < 0) {
-            throw std::runtime_error("module " + module.id + " must define chip_select_gpio");
+        if (module.chip_select_gpio < -1) {
+            throw std::runtime_error(
+                "module " + module.id + " must define chip_select_gpio >= -1 (-1 means hardware CS)");
         }
         if (module.midi_port_count < 1 || module.midi_port_count > 3) {
             throw std::runtime_error("module " + module.id + " must define midi_port_count between 1 and 3");

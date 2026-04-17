@@ -17,10 +17,19 @@ struct BusIoMetrics {
     std::size_t queue_capacity {0};
     std::size_t queue_high_watermark {0};
     std::uint64_t dropped_events {0};
+    std::size_t output_queue_depth {0};
+    std::size_t output_queue_capacity {0};
+    std::size_t output_queue_high_watermark {0};
+    std::uint64_t output_dropped_events {0};
+    std::uint64_t output_sent_events {0};
+    std::uint64_t output_failed_events {0};
 };
 
 struct IoMetrics {
     std::uint64_t dropped_events_total {0};
+    std::uint64_t output_dropped_events_total {0};
+    std::uint64_t output_sent_events_total {0};
+    std::uint64_t output_failed_events_total {0};
     std::size_t queue_capacity_per_bus {0};
     std::size_t warning_threshold_percent {0};
     std::vector<BusIoMetrics> buses;
@@ -41,6 +50,7 @@ public:
     void start();
     void stop();
     void enqueue(MidiPacket packet);
+    bool send_midi(std::size_t global_port, std::vector<std::uint8_t> bytes, std::string& error);
     IoMetrics snapshot() const;
 
 private:

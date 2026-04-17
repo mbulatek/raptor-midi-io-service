@@ -89,6 +89,9 @@ json encode_stats_json(const MidiIoStats& stats) {
         {"spi_invalid_port_drops_total", stats.spi_invalid_port_drops_total},
         {"bus_queue_dropped_events_total", stats.bus_queue_dropped_events_total},
         {"usb_queue_dropped_events_total", stats.usb_queue_dropped_events_total},
+        {"output_queue_dropped_events_total", stats.output_queue_dropped_events_total},
+        {"output_sent_events_total", stats.output_sent_events_total},
+        {"output_failed_events_total", stats.output_failed_events_total},
     };
 }
 std::filesystem::path endpoint_directory(const std::string& endpoint) {
@@ -217,10 +220,13 @@ void EventBus::publish_stats(const MidiIoStats& stats) {
 
     // When ZeroMQ isn't available, stats are only visible via logs.
     spdlog::trace(
-        "publish stats endpoint={} spi_invalid_port_drops_total={} bus_queue_dropped_events_total={} usb_queue_dropped_events_total={}",
+        "publish stats endpoint={} spi_invalid_port_drops_total={} bus_queue_dropped_events_total={} usb_queue_dropped_events_total={} output_queue_dropped_events_total={} output_sent_events_total={} output_failed_events_total={}",
         events_endpoint_,
         stats.spi_invalid_port_drops_total,
         stats.bus_queue_dropped_events_total,
-        stats.usb_queue_dropped_events_total);
+        stats.usb_queue_dropped_events_total,
+        stats.output_queue_dropped_events_total,
+        stats.output_sent_events_total,
+        stats.output_failed_events_total);
 }
 }  // namespace raptor::midi_io
