@@ -52,13 +52,17 @@ int Application::run() {
         }
     };
 
-    ControlServer control {config_.ipc.control_endpoint, config_, reload_handler};
+    auto send_midi_handler = [&](std::size_t global_port, const std::vector<std::uint8_t>& bytes, std::string& error) -> bool {
+        return io_loop->send_midi(global_port, bytes, error);
+    };
+
+    ControlServer control {config_.ipc.control_endpoint, config_, reload_handler, send_midi_handler};
 
     spdlog::info(
         "started with {} SPI modules and {} configured USB MIDI controller slots",
         config_.modules.size(),
         config_.usb_midi_controllers.size());
-    spdlog::info("I/O loop handles SPI, USB MIDI upstream, and MIDI event publication");
+    spdlog::info("I/O loop handles SPI/USB MIDI upstream, SPI MIDI downstream, and MIDI event publication");
 
     for (;;) {
         control.set_snapshot(ServiceSnapshot {

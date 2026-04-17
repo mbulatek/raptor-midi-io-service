@@ -47,11 +47,20 @@ json render_io_metrics(const IoMetrics& metrics) {
             {"queue_capacity", bus.queue_capacity},
             {"queue_high_watermark", bus.queue_high_watermark},
             {"dropped_events", bus.dropped_events},
+            {"output_queue_depth", bus.output_queue_depth},
+            {"output_queue_capacity", bus.output_queue_capacity},
+            {"output_queue_high_watermark", bus.output_queue_high_watermark},
+            {"output_dropped_events", bus.output_dropped_events},
+            {"output_sent_events", bus.output_sent_events},
+            {"output_failed_events", bus.output_failed_events},
         });
     }
 
     return {
         {"dropped_events_total", metrics.dropped_events_total},
+        {"output_dropped_events_total", metrics.output_dropped_events_total},
+        {"output_sent_events_total", metrics.output_sent_events_total},
+        {"output_failed_events_total", metrics.output_failed_events_total},
         {"queue_capacity_per_bus", metrics.queue_capacity_per_bus},
         {"warning_threshold_percent", metrics.warning_threshold_percent},
         {"buses", std::move(buses)},
@@ -77,6 +86,7 @@ json render_module(const ModuleConfig& module) {
 struct ControlRequest {
     std::string command;
     std::string request_id;
+    json data {json::object()};
     bool parse_error {false};
 };
 
@@ -96,10 +106,58 @@ ControlRequest parse_request(const std::string& request_text) {
         if (root.contains("request_id") && root["request_id"].is_string()) {
             request.request_id = root["request_id"].get<std::string>();
         }
+        if (root.contains("data")) {
+            request.data = root["data"];
+        }
         return request;
     } catch (const std::exception&) {
         return ControlRequest {.parse_error = true};
     }
+}
+
+bool parse_send_midi_data(const json& data, std::size_t& global_port, std::vector<std::uint8_t>& bytes, std::string& error) {
+    if (!data.is_object()) {
+        error = "send-midi requires object field data";
+        return false;
+    }
+
+    if (!data.contains("global_port") || !data["global_port"].is_number_integer()) {
+        error = "send-midi requires integer data.global_port";
+        return false;
+    }
+    const auto gp = data["global_port"].get<long long>();
+    if (gp < 1) {
+        error = "data.global_port must be >= 1";
+        return false;
+    }
+    global_port = static_cast<std::size_t>(gp);
+
+    if (!data.contains("bytes") || !data["bytes"].is_array()) {
+        error = "send-midi requires array data.bytes";
+        return false;
+    }
+
+    const auto& arr = data["bytes"];
+    if (arr.empty() || arr.size() > 3) {
+        error = "data.bytes must have 1..3 items";
+        return false;
+    }
+
+    bytes.clear();
+    bytes.reserve(arr.size());
+    for (const auto& item : arr) {
+        if (!item.is_number_integer()) {
+            error = "data.bytes items must be integers";
+            return false;
+        }
+        const auto value = item.get<long long>();
+        if (value < 0 || value > 255) {
+            error = "data.bytes items must be in range 0..255";
+            return false;
+        }
+        bytes.push_back(static_cast<std::uint8_t>(value));
+    }
+    return true;
 }
 
 json envelope(const std::string& command, const std::string& request_id, const ServiceSnapshot& snapshot, bool ok) {
@@ -142,7 +200,7 @@ std::string render_reply(const ControlRequest& request,
     const auto& command = request.command;
     if (command == "help") {
         return ok_reply(command, request.request_id, snapshot,
-                        json {{"commands", json::array({"help", "ping", "status", "list-modules", "reload-config"})}});
+                        json {{"commands", json::array({"help", "ping", "status", "list-modules", "reload-config", "send-midi"})}});
     }
     if (command == "ping") {
         return ok_reply(command, request.request_id, snapshot, json {{"message", "pong"}});
@@ -195,8 +253,16 @@ struct ControlServer::Impl {
 #endif
 };
 
-ControlServer::ControlServer(std::string control_endpoint, const ServiceConfig& config, ReloadHandler reload_handler)
-    : control_endpoint_(std::move(control_endpoint)), reload_handler_(std::move(reload_handler)), config_(&config), impl_(std::make_unique<Impl>()) {
+ControlServer::ControlServer(
+    std::string control_endpoint,
+    const ServiceConfig& config,
+    ReloadHandler reload_handler,
+    SendMidiHandler send_midi_handler)
+    : control_endpoint_(std::move(control_endpoint)),
+      reload_handler_(std::move(reload_handler)),
+      send_midi_handler_(std::move(send_midi_handler)),
+      config_(&config),
+      impl_(std::make_unique<Impl>()) {
     snapshot_.module_count = config.modules.size();
     snapshot_.events_endpoint = config.ipc.events_endpoint;
     snapshot_.control_endpoint = config.ipc.control_endpoint;
@@ -317,6 +383,48 @@ void ControlServer::poll_once() {
                     {"usb_midi_controller_count", config_ ? config_->usb_midi_controllers.size() : 0}
                 };
                 reply = ok_reply(request.command, request.request_id, snapshot_, std::move(data));
+            }
+        }
+    } else if (request.command == "send-midi") {
+        if (!send_midi_handler_) {
+            reply = error_reply(
+                request.command,
+                request.request_id,
+                snapshot_,
+                "unsupported",
+                "send-midi is not configured");
+        } else {
+            std::size_t global_port = 0;
+            std::vector<std::uint8_t> bytes;
+            std::string parse_error_message;
+            if (!parse_send_midi_data(request.data, global_port, bytes, parse_error_message)) {
+                reply = error_reply(
+                    request.command,
+                    request.request_id,
+                    snapshot_,
+                    "invalid-request",
+                    parse_error_message);
+            } else {
+                std::string send_error;
+                const bool ok = send_midi_handler_(global_port, bytes, send_error);
+                if (!ok) {
+                    reply = error_reply(
+                        request.command,
+                        request.request_id,
+                        snapshot_,
+                        "send-failed",
+                        send_error.empty() ? "send-midi failed" : send_error);
+                } else {
+                    reply = ok_reply(
+                        request.command,
+                        request.request_id,
+                        snapshot_,
+                        json {
+                            {"message", "queued"},
+                            {"global_port", global_port},
+                            {"bytes", bytes},
+                        });
+                }
             }
         }
     } else {

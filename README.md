@@ -22,6 +22,7 @@ Daemon for Raspberry Pi that reads MIDI packets from multiple ESP-based MIDI I/O
 - JSON parsing and serialization use `nlohmann_json`
 - global MIDI port numbering is derived from SPI module order
 - USB MIDI upstream is now implemented through ALSA sequencer and publishes on the same `midi.packet` bus
+- SPI MIDI downstream is implemented via control command `send-midi` and routes by global MIDI port
 
 ## IPC choice
 
@@ -31,6 +32,23 @@ Suggested split:
 
 - `ipc:///run/raptor-midi-io/events.zmq`: daemon publishes MIDI packets from SPI and USB sources
 - `ipc:///run/raptor-midi-io/control.zmq`: daemon exposes control, health, diagnostics, and runtime commands
+
+### Downstream MIDI (RPi -> ESP module)
+
+Control command `send-midi` queues a MIDI message for SPI transfer to the resolved module/port.
+
+Request:
+
+```json
+{
+  "command": "send-midi",
+  "request_id": "tx-1",
+  "data": {
+    "global_port": 1,
+    "bytes": [144, 60, 100]
+  }
+}
+```
 
 ## Event schema
 
