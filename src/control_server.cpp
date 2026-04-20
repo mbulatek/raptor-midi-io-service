@@ -341,6 +341,10 @@ void ControlServer::poll_once() {
         zmq_msg_close(&identity);
         return;
     }
+    if (zmq_msg_more(&identity) == 0) {
+        zmq_msg_close(&identity);
+        return;
+    }
 
     zmq_msg_t command_msg;
     zmq_msg_init(&command_msg);
@@ -348,6 +352,31 @@ void ControlServer::poll_once() {
         zmq_msg_close(&identity);
         zmq_msg_close(&command_msg);
         return;
+    }
+
+    // ROUTER can receive:
+    // - REQ:    [identity][empty][payload]
+    // - DEALER: [identity][payload]
+    // Consume optional delimiter and keep parser aligned.
+    if (zmq_msg_size(&command_msg) == 0 && zmq_msg_more(&command_msg) != 0) {
+        zmq_msg_close(&command_msg);
+        zmq_msg_init(&command_msg);
+        if (zmq_msg_recv(&command_msg, impl_->router, 0) < 0) {
+            zmq_msg_close(&identity);
+            zmq_msg_close(&command_msg);
+            return;
+        }
+    }
+
+    // Drain any extra frames to avoid desynchronizing the next request.
+    while (zmq_msg_more(&command_msg) != 0) {
+        zmq_msg_t junk;
+        zmq_msg_init(&junk);
+        if (zmq_msg_recv(&junk, impl_->router, 0) < 0) {
+            zmq_msg_close(&junk);
+            break;
+        }
+        zmq_msg_close(&junk);
     }
 
     const auto* data = static_cast<const char*>(zmq_msg_data(&command_msg));
@@ -433,6 +462,8 @@ void ControlServer::poll_once() {
     spdlog::debug("control reply endpoint={} bytes={} command={} ok_hint={}", control_endpoint_, reply.size(), request.command, request.parse_error ? "parse-error" : "rendered");
 
     (void)zmq_send(impl_->router, zmq_msg_data(&identity), zmq_msg_size(&identity), ZMQ_SNDMORE);
+    // Keep reply framing compatible with REQ and DEALER clients.
+    (void)zmq_send(impl_->router, "", 0, ZMQ_SNDMORE);
     (void)zmq_send(impl_->router, reply.data(), reply.size(), 0);
 
     zmq_msg_close(&identity);
