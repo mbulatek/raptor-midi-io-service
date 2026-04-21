@@ -61,8 +61,12 @@ json render_io_metrics(const IoMetrics& metrics) {
         {"output_dropped_events_total", metrics.output_dropped_events_total},
         {"output_sent_events_total", metrics.output_sent_events_total},
         {"output_failed_events_total", metrics.output_failed_events_total},
+        {"route_forwarded_events_total", metrics.route_forwarded_events_total},
+        {"route_dropped_events_total", metrics.route_dropped_events_total},
         {"queue_capacity_per_bus", metrics.queue_capacity_per_bus},
         {"warning_threshold_percent", metrics.warning_threshold_percent},
+        {"route_count", metrics.route_count},
+        {"active_route_id", metrics.active_route_id},
         {"buses", std::move(buses)},
     };
 }
@@ -160,6 +164,47 @@ bool parse_send_midi_data(const json& data, std::size_t& global_port, std::vecto
     return true;
 }
 
+bool parse_set_route_data(const json& data, MidiRouteConfig& route, std::string& error) {
+    if (!data.is_object()) {
+        error = "set-route requires object field data";
+        return false;
+    }
+    if (!data.contains("id") || !data["id"].is_string()) {
+        error = "set-route requires string data.id";
+        return false;
+    }
+
+    route = MidiRouteConfig {};
+    route.id = data["id"].get<std::string>();
+    route.midi_in_port = data.contains("midi_in_port") && data["midi_in_port"].is_number_integer()
+        ? data["midi_in_port"].get<int>()
+        : -1;
+    route.midi_in_channel = data.contains("midi_in_channel") && data["midi_in_channel"].is_number_integer()
+        ? data["midi_in_channel"].get<int>()
+        : 0;
+    route.midi_out_port = data.contains("midi_out_port") && data["midi_out_port"].is_number_integer()
+        ? data["midi_out_port"].get<int>()
+        : -1;
+    route.midi_out_channel = data.contains("midi_out_channel") && data["midi_out_channel"].is_number_integer()
+        ? data["midi_out_channel"].get<int>()
+        : 1;
+    route.enabled = !(data.contains("enabled") && data["enabled"].is_boolean() && !data["enabled"].get<bool>());
+    return true;
+}
+
+bool parse_route_id_data(const json& data, std::string& route_id, std::string& error, const std::string& command_name) {
+    if (!data.is_object()) {
+        error = command_name + " requires object field data";
+        return false;
+    }
+    if (!data.contains("id") || !data["id"].is_string()) {
+        error = command_name + " requires string data.id";
+        return false;
+    }
+    route_id = data["id"].get<std::string>();
+    return true;
+}
+
 json envelope(const std::string& command, const std::string& request_id, const ServiceSnapshot& snapshot, bool ok) {
     json root = {
         {"schema_version", kSchemaVersion},
@@ -200,7 +245,17 @@ std::string render_reply(const ControlRequest& request,
     const auto& command = request.command;
     if (command == "help") {
         return ok_reply(command, request.request_id, snapshot,
-                        json {{"commands", json::array({"help", "ping", "status", "list-modules", "reload-config", "send-midi"})}});
+                        json {{"commands", json::array({
+                            "help",
+                            "ping",
+                            "status",
+                            "list-modules",
+                            "reload-config",
+                            "send-midi",
+                            "set-route",
+                            "remove-route",
+                            "set-active-route",
+                        })}});
     }
     if (command == "ping") {
         return ok_reply(command, request.request_id, snapshot, json {{"message", "pong"}});
@@ -257,10 +312,16 @@ ControlServer::ControlServer(
     std::string control_endpoint,
     const ServiceConfig& config,
     ReloadHandler reload_handler,
-    SendMidiHandler send_midi_handler)
+    SendMidiHandler send_midi_handler,
+    UpsertRouteHandler upsert_route_handler,
+    RemoveRouteHandler remove_route_handler,
+    SetActiveRouteHandler set_active_route_handler)
     : control_endpoint_(std::move(control_endpoint)),
       reload_handler_(std::move(reload_handler)),
       send_midi_handler_(std::move(send_midi_handler)),
+      upsert_route_handler_(std::move(upsert_route_handler)),
+      remove_route_handler_(std::move(remove_route_handler)),
+      set_active_route_handler_(std::move(set_active_route_handler)),
       config_(&config),
       impl_(std::make_unique<Impl>()) {
     snapshot_.module_count = config.modules.size();
@@ -341,6 +402,10 @@ void ControlServer::poll_once() {
         zmq_msg_close(&identity);
         return;
     }
+    if (zmq_msg_more(&identity) == 0) {
+        zmq_msg_close(&identity);
+        return;
+    }
 
     zmq_msg_t command_msg;
     zmq_msg_init(&command_msg);
@@ -348,6 +413,31 @@ void ControlServer::poll_once() {
         zmq_msg_close(&identity);
         zmq_msg_close(&command_msg);
         return;
+    }
+
+    // ROUTER can receive:
+    // - REQ:    [identity][empty][payload]
+    // - DEALER: [identity][payload]
+    // Consume optional delimiter and keep parser aligned.
+    if (zmq_msg_size(&command_msg) == 0 && zmq_msg_more(&command_msg) != 0) {
+        zmq_msg_close(&command_msg);
+        zmq_msg_init(&command_msg);
+        if (zmq_msg_recv(&command_msg, impl_->router, 0) < 0) {
+            zmq_msg_close(&identity);
+            zmq_msg_close(&command_msg);
+            return;
+        }
+    }
+
+    // Drain any extra frames to avoid desynchronizing the next request.
+    while (zmq_msg_more(&command_msg) != 0) {
+        zmq_msg_t junk;
+        zmq_msg_init(&junk);
+        if (zmq_msg_recv(&junk, impl_->router, 0) < 0) {
+            zmq_msg_close(&junk);
+            break;
+        }
+        zmq_msg_close(&junk);
     }
 
     const auto* data = static_cast<const char*>(zmq_msg_data(&command_msg));
@@ -427,12 +517,139 @@ void ControlServer::poll_once() {
                 }
             }
         }
+    } else if (request.command == "set-route") {
+        if (!upsert_route_handler_) {
+            reply = error_reply(
+                request.command,
+                request.request_id,
+                snapshot_,
+                "unsupported",
+                "set-route is not configured");
+        } else {
+            MidiRouteConfig route;
+            std::string parse_error_message;
+            if (!parse_set_route_data(request.data, route, parse_error_message)) {
+                reply = error_reply(
+                    request.command,
+                    request.request_id,
+                    snapshot_,
+                    "invalid-request",
+                    parse_error_message);
+            } else {
+                std::string route_error;
+                const bool ok = upsert_route_handler_(route, route_error);
+                if (!ok) {
+                    reply = error_reply(
+                        request.command,
+                        request.request_id,
+                        snapshot_,
+                        "route-failed",
+                        route_error.empty() ? "set-route failed" : route_error);
+                } else {
+                    reply = ok_reply(
+                        request.command,
+                        request.request_id,
+                        snapshot_,
+                        json {
+                            {"message", "route-upserted"},
+                            {"id", route.id},
+                            {"midi_in_port", route.midi_in_port},
+                            {"midi_in_channel", route.midi_in_channel},
+                            {"midi_out_port", route.midi_out_port},
+                            {"midi_out_channel", route.midi_out_channel},
+                            {"enabled", route.enabled},
+                        });
+                }
+            }
+        }
+    } else if (request.command == "remove-route") {
+        if (!remove_route_handler_) {
+            reply = error_reply(
+                request.command,
+                request.request_id,
+                snapshot_,
+                "unsupported",
+                "remove-route is not configured");
+        } else {
+            std::string route_id;
+            std::string parse_error_message;
+            if (!parse_route_id_data(request.data, route_id, parse_error_message, "remove-route")) {
+                reply = error_reply(
+                    request.command,
+                    request.request_id,
+                    snapshot_,
+                    "invalid-request",
+                    parse_error_message);
+            } else {
+                std::string route_error;
+                const bool ok = remove_route_handler_(route_id, route_error);
+                if (!ok) {
+                    reply = error_reply(
+                        request.command,
+                        request.request_id,
+                        snapshot_,
+                        "route-failed",
+                        route_error.empty() ? "remove-route failed" : route_error);
+                } else {
+                    reply = ok_reply(
+                        request.command,
+                        request.request_id,
+                        snapshot_,
+                        json {
+                            {"message", "route-removed"},
+                            {"id", route_id},
+                        });
+                }
+            }
+        }
+    } else if (request.command == "set-active-route") {
+        if (!set_active_route_handler_) {
+            reply = error_reply(
+                request.command,
+                request.request_id,
+                snapshot_,
+                "unsupported",
+                "set-active-route is not configured");
+        } else {
+            std::string route_id;
+            std::string parse_error_message;
+            if (!parse_route_id_data(request.data, route_id, parse_error_message, "set-active-route")) {
+                reply = error_reply(
+                    request.command,
+                    request.request_id,
+                    snapshot_,
+                    "invalid-request",
+                    parse_error_message);
+            } else {
+                std::string route_error;
+                const bool ok = set_active_route_handler_(route_id, route_error);
+                if (!ok) {
+                    reply = error_reply(
+                        request.command,
+                        request.request_id,
+                        snapshot_,
+                        "route-failed",
+                        route_error.empty() ? "set-active-route failed" : route_error);
+                } else {
+                    reply = ok_reply(
+                        request.command,
+                        request.request_id,
+                        snapshot_,
+                        json {
+                            {"message", "active-route-updated"},
+                            {"id", route_id},
+                        });
+                }
+            }
+        }
     } else {
         reply = render_reply(request, *config_, snapshot_);
     }
     spdlog::debug("control reply endpoint={} bytes={} command={} ok_hint={}", control_endpoint_, reply.size(), request.command, request.parse_error ? "parse-error" : "rendered");
 
     (void)zmq_send(impl_->router, zmq_msg_data(&identity), zmq_msg_size(&identity), ZMQ_SNDMORE);
+    // Keep reply framing compatible with REQ and DEALER clients.
+    (void)zmq_send(impl_->router, "", 0, ZMQ_SNDMORE);
     (void)zmq_send(impl_->router, reply.data(), reply.size(), 0);
 
     zmq_msg_close(&identity);

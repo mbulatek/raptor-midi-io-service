@@ -13,11 +13,17 @@ struct SpiReadResult {
     std::vector<std::uint8_t> bytes;
 };
 
+struct SpiTxEvent {
+    std::size_t local_port {1};
+    std::vector<std::uint8_t> bytes;
+};
+
 class SpiBus {
 public:
     SpiBus() = default;
     SpiReadResult read_packet(const ModuleConfig& module);
     bool write_packet(const ModuleConfig& module, std::size_t local_port, const std::vector<std::uint8_t>& bytes);
+    bool write_packets(const ModuleConfig& module, const std::vector<SpiTxEvent>& events);
 };
 
 }  // namespace raptor::midi_io
