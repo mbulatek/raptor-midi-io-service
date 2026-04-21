@@ -28,6 +28,7 @@ namespace raptor::midi_io {
 namespace {
 
 #if defined(__linux__)
+constexpr std::size_t kEspBridgeFrameBytes = 96;
 
 static std::string hex_dump(const std::vector<std::uint8_t>& bytes) {
     std::string out;
@@ -360,15 +361,16 @@ bool transfer_frame(const ModuleConfig& module, const std::vector<std::uint8_t>&
 
 SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
 #if defined(__linux__)
-    std::vector<std::uint8_t> tx(module.max_frame_bytes, 0x00);
-    std::vector<std::uint8_t> rx(module.max_frame_bytes, 0x00);
+    const auto frame_size = std::max<std::size_t>(module.max_frame_bytes, kEspBridgeFrameBytes);
+    std::vector<std::uint8_t> tx(frame_size, 0x00);
+    std::vector<std::uint8_t> rx(frame_size, 0x00);
     spdlog::trace(
         "spi read module={} dev={} speed_hz={} mode={} frame_bytes={} cs_gpio={}",
         module.id,
         module.spi_device,
         module.spi_speed_hz,
         static_cast<int>(module.spi_mode),
-        module.max_frame_bytes,
+        frame_size,
         module.chip_select_gpio);
     if (!transfer_frame(module, tx, rx)) {
         return {};
@@ -455,7 +457,7 @@ bool SpiBus::write_packets(const ModuleConfig& module, const std::vector<SpiTxEv
     constexpr std::uint32_t kMagicBatch = 0x4D494442u;   // "MIDB"
     constexpr std::size_t kBatchHeaderSize = 17;         // magic+seq+ts+count
     constexpr std::size_t kBatchEventSize = 5;           // local_port,size,status,data1,data2
-    const std::size_t frame_size = std::max<std::size_t>(module.max_frame_bytes, kPacketSize);
+    const std::size_t frame_size = std::max<std::size_t>(std::max<std::size_t>(module.max_frame_bytes, kPacketSize), kEspBridgeFrameBytes);
 
     const auto max_batch_events = (frame_size > kBatchHeaderSize)
                                       ? ((frame_size - kBatchHeaderSize) / kBatchEventSize)

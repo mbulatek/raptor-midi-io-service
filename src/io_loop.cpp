@@ -12,15 +12,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <spdlog/spdlog.h>
+
+#if RAPTOR_MIDI_IO_HAS_ZEROMQ
+#include <zmq.h>
+#endif
 
 namespace raptor::midi_io {
 
@@ -58,6 +64,47 @@ int midi_channel_from_status(const std::uint8_t status) {
     }
     return static_cast<int>((status & 0x0F) + 1);
 }
+
+std::uint64_t monotonic_time_ns() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
+std::filesystem::path endpoint_directory(const std::string& endpoint) {
+    constexpr std::string_view prefix {"ipc://"};
+    if (!endpoint.starts_with(prefix)) {
+        return {};
+    }
+
+    auto path = endpoint.substr(prefix.size());
+    return std::filesystem::path {path}.parent_path();
+}
+
+#if RAPTOR_MIDI_IO_HAS_ZEROMQ
+constexpr std::uint32_t kPlaybackRtMagic = 0x4D505431u; // "MPT1"
+constexpr std::uint16_t kPlaybackRtVersion = 1u;
+constexpr std::size_t kPlaybackRtBytes = 32;
+
+std::uint16_t read_u16_le(const std::uint8_t* p) {
+    return static_cast<std::uint16_t>(p[0]) |
+           (static_cast<std::uint16_t>(p[1]) << 8);
+}
+
+std::uint32_t read_u32_le(const std::uint8_t* p) {
+    return static_cast<std::uint32_t>(p[0]) |
+           (static_cast<std::uint32_t>(p[1]) << 8) |
+           (static_cast<std::uint32_t>(p[2]) << 16) |
+           (static_cast<std::uint32_t>(p[3]) << 24);
+}
+
+std::uint64_t read_u64_le(const std::uint8_t* p) {
+    std::uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= (static_cast<std::uint64_t>(p[i]) << (8 * i));
+    }
+    return value;
+}
+#endif
 
 }  // namespace
 
@@ -418,6 +465,7 @@ struct IoLoop::Impl {
                         .module_last_global_port = triggered.last_global_midi_port,
                         .local_port = read_result.local_port,
                         .global_port = global_port,
+                        .timestamp_ns = monotonic_time_ns(),
                         .bytes = std::move(read_result.bytes),
                         .sequence = sequence,
                     };
@@ -478,6 +526,7 @@ struct IoLoop::Impl {
                     const auto seq_first = outbound_batch.front().sequence;
                     const auto seq_last = outbound_batch.back().sequence;
                     std::size_t total_midi_bytes = 0;
+                    std::uint32_t tx_interframe_delay_us = 0;
                     for (const auto& item : outbound_batch) {
                         total_midi_bytes += item.bytes.size();
                     }
@@ -485,6 +534,7 @@ struct IoLoop::Impl {
                     bool sent = false;
                     if (module_index < worker.modules.size()) {
                         const auto& module = worker.modules[module_index];
+                        tx_interframe_delay_us = module.tx_interframe_delay_us;
                         std::vector<SpiTxEvent> spi_events;
                         spi_events.reserve(outbound_batch.size());
                         std::size_t first_global_port = outbound_batch.front().global_port;
@@ -538,6 +588,10 @@ struct IoLoop::Impl {
                             worker.output_failed_events += outbound_batch.size();
                         }
                     }
+
+                    if (tx_interframe_delay_us > 0) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(tx_interframe_delay_us));
+                    }
                     continue;
                 }
 
@@ -552,8 +606,11 @@ struct IoLoop::Impl {
     }
 
     void publisher_loop() {
-        EventBus bus {config.ipc.events_endpoint};
-        spdlog::debug("io publisher start endpoint={}", config.ipc.events_endpoint);
+        EventBus bus {config.ipc.events_endpoint, config.ipc.realtime_events_endpoint};
+        spdlog::debug(
+            "io publisher start endpoint={} realtime_endpoint={}",
+            config.ipc.events_endpoint,
+            config.ipc.realtime_events_endpoint);
         std::size_t next_bus_index = 0;
 
         MidiIoStats last_stats;
@@ -647,6 +704,135 @@ struct IoLoop::Impl {
         spdlog::debug("io publisher stopped");
     }
 
+    void playback_rt_loop() {
+#if RAPTOR_MIDI_IO_HAS_ZEROMQ
+        if (config.ipc.playback_endpoint.empty()) {
+            return;
+        }
+
+        const auto directory = endpoint_directory(config.ipc.playback_endpoint);
+        if (!directory.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(directory, ec);
+            if (ec) {
+                spdlog::warn("playback rt failed to create endpoint directory {}: {}", directory.string(), ec.message());
+            }
+        }
+
+        void* context = zmq_ctx_new();
+        if (context == nullptr) {
+            spdlog::warn("playback rt zmq_ctx_new failed endpoint={} err={}", config.ipc.playback_endpoint, zmq_strerror(zmq_errno()));
+            return;
+        }
+
+        void* socket = zmq_socket(context, ZMQ_PULL);
+        if (socket == nullptr) {
+            spdlog::warn("playback rt zmq_socket(ZMQ_PULL) failed endpoint={} err={}", config.ipc.playback_endpoint, zmq_strerror(zmq_errno()));
+            zmq_ctx_term(context);
+            return;
+        }
+
+        constexpr int linger_ms = 0;
+        constexpr int rcv_timeout_ms = 20;
+        (void)zmq_setsockopt(socket, ZMQ_LINGER, &linger_ms, sizeof(linger_ms));
+        (void)zmq_setsockopt(socket, ZMQ_RCVTIMEO, &rcv_timeout_ms, sizeof(rcv_timeout_ms));
+
+        if (zmq_bind(socket, config.ipc.playback_endpoint.c_str()) != 0) {
+            spdlog::warn("playback rt zmq_bind failed endpoint={} err={}", config.ipc.playback_endpoint, zmq_strerror(zmq_errno()));
+            zmq_close(socket);
+            zmq_ctx_term(context);
+            return;
+        }
+
+        spdlog::info("playback rt consumer started endpoint={}", config.ipc.playback_endpoint);
+        while (!stop_requested.load(std::memory_order_relaxed)) {
+            std::uint8_t payload[kPlaybackRtBytes] = {};
+            const int recv = zmq_recv(socket, payload, static_cast<int>(sizeof(payload)), 0);
+            if (recv < 0) {
+                const int err = zmq_errno();
+                if (err == EAGAIN || err == EINTR) {
+                    continue;
+                }
+                spdlog::warn("playback rt recv failed endpoint={} err={}", config.ipc.playback_endpoint, zmq_strerror(err));
+                continue;
+            }
+
+            const std::size_t bytes = static_cast<std::size_t>(recv);
+            if (bytes < kPlaybackRtBytes) {
+                const auto dropped = playback_rt_decode_errors.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (dropped == 1 || (dropped % 200) == 0) {
+                    spdlog::warn("playback rt frame too short endpoint={} bytes={} dropped={}", config.ipc.playback_endpoint, bytes, dropped);
+                }
+                continue;
+            }
+
+            const auto magic = read_u32_le(payload + 0);
+            const auto version = read_u16_le(payload + 4);
+            const auto sequence = read_u64_le(payload + 8);
+            const auto timestamp_ns = read_u64_le(payload + 16);
+            const auto global_port = static_cast<std::size_t>(read_u32_le(payload + 24));
+            const std::uint8_t size = payload[28];
+
+            if (magic != kPlaybackRtMagic || version != kPlaybackRtVersion || global_port == 0 || size < 1 || size > 3) {
+                const auto dropped = playback_rt_decode_errors.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (dropped == 1 || (dropped % 200) == 0) {
+                    spdlog::warn(
+                        "playback rt invalid frame endpoint={} seq={} ts_ns={} port={} size={} dropped={}",
+                        config.ipc.playback_endpoint,
+                        sequence,
+                        timestamp_ns,
+                        global_port,
+                        static_cast<unsigned int>(size),
+                        dropped);
+                }
+                continue;
+            }
+
+            std::vector<std::uint8_t> midi_bytes;
+            midi_bytes.reserve(size);
+            midi_bytes.push_back(payload[29]);
+            if (size > 1) {
+                midi_bytes.push_back(payload[30]);
+            }
+            if (size > 2) {
+                midi_bytes.push_back(payload[31]);
+            }
+
+            std::string error;
+            if (enqueue_output(global_port, std::move(midi_bytes), error)) {
+                playback_rt_forwarded.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                const auto dropped = playback_rt_enqueue_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (dropped == 1 || (dropped % 200) == 0) {
+                    spdlog::warn(
+                        "playback rt enqueue failed endpoint={} seq={} port={} err={} dropped={}",
+                        config.ipc.playback_endpoint,
+                        sequence,
+                        global_port,
+                        error,
+                        dropped);
+                }
+            }
+        }
+
+        zmq_close(socket);
+        zmq_ctx_term(context);
+        spdlog::info(
+            "playback rt consumer stopped endpoint={} forwarded={} enqueue_dropped={} decode_dropped={}",
+            config.ipc.playback_endpoint,
+            playback_rt_forwarded.load(std::memory_order_relaxed),
+            playback_rt_enqueue_dropped.load(std::memory_order_relaxed),
+            playback_rt_decode_errors.load(std::memory_order_relaxed));
+#endif
+    }
+
+    void start_playback_rt_consumer() {
+        if (playback_rt_consumer.joinable()) {
+            return;
+        }
+        playback_rt_consumer = std::thread([this]() { playback_rt_loop(); });
+    }
+
     bool has_pending_items_locked() const {
         if (!usb_queue.empty()) {
             return true;
@@ -697,6 +883,7 @@ struct IoLoop::Impl {
         stop_requested.store(false, std::memory_order_relaxed);
 
         publisher = std::thread([this]() { publisher_loop(); });
+        start_playback_rt_consumer();
         usb_midi_input.start();
         for (auto& worker : bus_workers) {
             start_bus_worker(worker);
@@ -713,6 +900,9 @@ struct IoLoop::Impl {
             if (worker.worker.joinable()) {
                 worker.worker.join();
             }
+        }
+        if (playback_rt_consumer.joinable()) {
+            playback_rt_consumer.join();
         }
         if (publisher.joinable()) {
             publisher.join();
@@ -743,6 +933,9 @@ struct IoLoop::Impl {
     }
 
     void enqueue(MidiPacket packet) {
+        if (packet.timestamp_ns == 0) {
+            packet.timestamp_ns = monotonic_time_ns();
+        }
         apply_active_route(packet);
         enqueue_locked(std::move(packet), usb_queue, usb_queue_high_watermark, usb_dropped_events);
         queue_cv.notify_one();
@@ -821,7 +1014,11 @@ struct IoLoop::Impl {
     std::string active_route_id;
     std::atomic<std::uint64_t> route_forwarded_events_total {0};
     std::atomic<std::uint64_t> route_dropped_events_total {0};
+    std::atomic<std::uint64_t> playback_rt_forwarded {0};
+    std::atomic<std::uint64_t> playback_rt_enqueue_dropped {0};
+    std::atomic<std::uint64_t> playback_rt_decode_errors {0};
     std::thread publisher;
+    std::thread playback_rt_consumer;
 };
 
 IoLoop::IoLoop(const ServiceConfig& config,

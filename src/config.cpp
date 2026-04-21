@@ -24,6 +24,8 @@ void load_global_ipc_overrides(const std::string& path, IpcConfig& ipc) {
     if (const auto ipc_root = root["ipc"]) {
         if (const auto midi_io = ipc_root["midi_io"]) {
             assign_if_present(midi_io, "events_endpoint", ipc.events_endpoint);
+            assign_if_present(midi_io, "realtime_events_endpoint", ipc.realtime_events_endpoint);
+            assign_if_present(midi_io, "playback_endpoint", ipc.playback_endpoint);
             assign_if_present(midi_io, "control_endpoint", ipc.control_endpoint);
         }
     }
@@ -62,6 +64,9 @@ void validate_config(const ServiceConfig& config) {
         }
         if (module.midi_port_count < 1 || module.midi_port_count > 3) {
             throw std::runtime_error("module " + module.id + " must define midi_port_count between 1 and 3");
+        }
+        if (module.tx_interframe_delay_us > 50'000) {
+            throw std::runtime_error("module " + module.id + " defines tx_interframe_delay_us > 50000");
         }
     }
 
@@ -103,11 +108,6 @@ ServiceConfig load_config(const std::string& path) {
 
     load_global_ipc_overrides(config.ipc_config_path, config.ipc);
 
-    if (const auto ipc = root["ipc"]) {
-        assign_if_present(ipc, "events_endpoint", config.ipc.events_endpoint);
-        assign_if_present(ipc, "control_endpoint", config.ipc.control_endpoint);
-    }
-
     if (const auto logging = root["logging"]) {
         assign_if_present(logging, "level", config.logging.level);
     }
@@ -133,6 +133,7 @@ ServiceConfig load_config(const std::string& path) {
             assign_if_present(node, "handshake_gpio", module.handshake_gpio);
             assign_if_present(node, "handshake_active_low", module.handshake_active_low);
             assign_if_present(node, "max_frame_bytes", module.max_frame_bytes);
+            assign_if_present(node, "tx_interframe_delay_us", module.tx_interframe_delay_us);
             assign_if_present(node, "midi_port_count", module.midi_port_count);
             config.modules.push_back(std::move(module));
         }

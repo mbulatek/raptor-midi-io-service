@@ -23,6 +23,7 @@ struct MidiPacket {
     std::size_t module_last_global_port {0};
     std::size_t local_port {0};
     std::size_t global_port {0};
+    std::uint64_t timestamp_ns {0};
     std::vector<std::uint8_t> bytes;
     std::uint64_t sequence {0};
 };
@@ -43,7 +44,7 @@ struct MidiIoStats {
 
 class EventBus {
 public:
-    explicit EventBus(std::string events_endpoint);
+    explicit EventBus(std::string events_endpoint, std::string realtime_events_endpoint = {});
     ~EventBus();
 
     EventBus(const EventBus&) = delete;
@@ -57,6 +58,7 @@ public:
 private:
     struct Impl;
     std::string events_endpoint_;
+    std::string realtime_events_endpoint_;
     std::unique_ptr<Impl> impl_;
 };
 

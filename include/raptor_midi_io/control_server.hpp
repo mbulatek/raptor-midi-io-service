@@ -15,6 +15,8 @@ struct ServiceSnapshot {
     std::size_t module_count {0};
     std::uint64_t published_packets {0};
     std::string events_endpoint;
+    std::string realtime_events_endpoint;
+    std::string playback_endpoint;
     std::string control_endpoint;
     std::string service_name {"raptor-midi-io-service"};
     IoMetrics io_metrics;
@@ -44,7 +46,8 @@ public:
     ControlServer& operator=(ControlServer&&) noexcept;
 
     void set_snapshot(ServiceSnapshot snapshot);
-    void poll_once();
+    // Returns true when a request was handled, false when no request was pending.
+    bool poll_once();
 
 private:
     struct Impl;

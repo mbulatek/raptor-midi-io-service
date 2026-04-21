@@ -38,10 +38,12 @@ int Application::run() {
             io_loop->start();
 
             spdlog::info(
-                "reload-config: ok modules={} usb_controllers={} events={} control={} log_level={}",
+                "reload-config: ok modules={} usb_controllers={} events={} events_rt={} playback_rt={} control={} log_level={}",
                 config_.modules.size(),
                 config_.usb_midi_controllers.size(),
                 config_.ipc.events_endpoint,
+                config_.ipc.realtime_events_endpoint,
+                config_.ipc.playback_endpoint,
                 config_.ipc.control_endpoint,
                 config_.logging.level);
             return true;
@@ -86,12 +88,21 @@ int Application::run() {
             .module_count = config_.modules.size(),
             .published_packets = published_packets_.load(std::memory_order_relaxed),
             .events_endpoint = config_.ipc.events_endpoint,
+            .realtime_events_endpoint = config_.ipc.realtime_events_endpoint,
+            .playback_endpoint = config_.ipc.playback_endpoint,
             .control_endpoint = config_.ipc.control_endpoint,
             .service_name = "raptor-midi-io-service",
             .io_metrics = io_loop->snapshot(),
         });
-        control.poll_once();
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Drain a bounded burst of control messages each tick.
+        // Keeping this bounded reduces SPI TX bursts that can overrun the slave-side re-arm window.
+        for (int i = 0; i < 64; ++i) {
+            if (!control.poll_once()) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

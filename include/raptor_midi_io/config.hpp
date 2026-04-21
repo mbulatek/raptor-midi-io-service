@@ -15,6 +15,7 @@ struct ModuleConfig {
     int handshake_gpio {-1};
     bool handshake_active_low {false};
     std::size_t max_frame_bytes {64};
+    std::uint32_t tx_interframe_delay_us {250};
     std::size_t midi_port_count {1};
     std::size_t first_global_midi_port {1};
     std::size_t last_global_midi_port {1};
@@ -28,6 +29,8 @@ struct UsbMidiControllerConfig {
 
 struct IpcConfig {
     std::string events_endpoint {"ipc:///run/raptor-midi-io/events.zmq"};
+    std::string realtime_events_endpoint {"ipc:///run/raptor-midi-io/events-rt.zmq"};
+    std::string playback_endpoint {"ipc:///run/raptor-midi-io/playback-rt.zmq"};
     std::string control_endpoint {"ipc:///run/raptor-midi-io/control.zmq"};
 };
 
