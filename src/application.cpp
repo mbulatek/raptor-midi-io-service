@@ -56,7 +56,24 @@ int Application::run() {
         return io_loop->send_midi(global_port, bytes, error);
     };
 
-    ControlServer control {config_.ipc.control_endpoint, config_, reload_handler, send_midi_handler};
+    auto upsert_route_handler = [&](const MidiRouteConfig& route, std::string& error) -> bool {
+        return io_loop->upsert_route(route, error);
+    };
+    auto remove_route_handler = [&](const std::string& route_id, std::string& error) -> bool {
+        return io_loop->remove_route(route_id, error);
+    };
+    auto set_active_route_handler = [&](const std::string& route_id, std::string& error) -> bool {
+        return io_loop->set_active_route(route_id, error);
+    };
+
+    ControlServer control {
+        config_.ipc.control_endpoint,
+        config_,
+        reload_handler,
+        send_midi_handler,
+        upsert_route_handler,
+        remove_route_handler,
+        set_active_route_handler};
 
     spdlog::info(
         "started with {} SPI modules and {} configured USB MIDI controller slots",

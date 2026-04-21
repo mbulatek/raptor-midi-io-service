@@ -24,12 +24,18 @@ class ControlServer {
 public:
     using ReloadHandler = std::function<bool(std::string& error)>;
     using SendMidiHandler = std::function<bool(std::size_t global_port, const std::vector<std::uint8_t>& bytes, std::string& error)>;
+    using UpsertRouteHandler = std::function<bool(const MidiRouteConfig& route, std::string& error)>;
+    using RemoveRouteHandler = std::function<bool(const std::string& route_id, std::string& error)>;
+    using SetActiveRouteHandler = std::function<bool(const std::string& route_id, std::string& error)>;
 
     ControlServer(
         std::string control_endpoint,
         const ServiceConfig& config,
         ReloadHandler reload_handler = {},
-        SendMidiHandler send_midi_handler = {});
+        SendMidiHandler send_midi_handler = {},
+        UpsertRouteHandler upsert_route_handler = {},
+        RemoveRouteHandler remove_route_handler = {},
+        SetActiveRouteHandler set_active_route_handler = {});
     ~ControlServer();
 
     ControlServer(const ControlServer&) = delete;
@@ -46,6 +52,9 @@ private:
     std::string control_endpoint_;
     ReloadHandler reload_handler_ {};
     SendMidiHandler send_midi_handler_ {};
+    UpsertRouteHandler upsert_route_handler_ {};
+    RemoveRouteHandler remove_route_handler_ {};
+    SetActiveRouteHandler set_active_route_handler_ {};
     const ServiceConfig* config_ {nullptr};
     ServiceSnapshot snapshot_;
     std::unique_ptr<Impl> impl_;

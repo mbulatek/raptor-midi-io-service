@@ -5,6 +5,7 @@
 #include "raptor_midi_io/spi_bus.hpp"
 #include "raptor_midi_io/usb_midi_input.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -30,6 +32,31 @@ std::size_t first_usb_global_port(const ServiceConfig& cfg) {
         next = m.last_global_midi_port + 1;
     }
     return next;
+}
+
+bool is_channel_message(const std::uint8_t status) {
+    return status >= 0x80 && status <= 0xEF;
+}
+
+bool is_note_off_message(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.empty()) {
+        return false;
+    }
+    const auto status = static_cast<std::uint8_t>(bytes[0] & 0xF0U);
+    if (status == 0x80U) {
+        return true;
+    }
+    if (status == 0x90U && bytes.size() >= 3 && bytes[2] == 0) {
+        return true;
+    }
+    return false;
+}
+
+int midi_channel_from_status(const std::uint8_t status) {
+    if (!is_channel_message(status)) {
+        return -1;
+    }
+    return static_cast<int>((status & 0x0F) + 1);
 }
 
 }  // namespace
@@ -73,6 +100,7 @@ struct IoLoop::Impl {
           published_packets(published_count),
           sequence_counter(sequence_count),
           usb_midi_input(config.usb_midi_controllers, first_usb_global_port(config), sequence_counter, [this](MidiPacket packet) {
+              apply_active_route(packet);
               enqueue_locked(std::move(packet), usb_queue, usb_queue_high_watermark, usb_dropped_events);
               queue_cv.notify_one();
           }) {}
@@ -148,14 +176,44 @@ struct IoLoop::Impl {
                 }
 
                 if (worker.queue_capacity > 0 && worker.output_queue.size() >= worker.queue_capacity) {
-                    worker.output_queue.pop_front();
-                    ++worker.output_dropped_events;
-                    if (worker.output_dropped_events == 1 || (worker.output_dropped_events % 100) == 0) {
-                        spdlog::warn(
-                            "bus output queue overflow bus={} dropped_events={} capacity={}",
-                            worker.bus_key,
-                            worker.output_dropped_events,
-                            worker.queue_capacity);
+                    const bool incoming_is_note_off = is_note_off_message(bytes);
+                    auto log_overflow = [&](const char* reason) {
+                        if (worker.output_dropped_events == 1 || (worker.output_dropped_events % 100) == 0) {
+                            spdlog::warn(
+                                "bus output queue overflow bus={} dropped_events={} capacity={} reason={}",
+                                worker.bus_key,
+                                worker.output_dropped_events,
+                                worker.queue_capacity,
+                                reason);
+                        }
+                    };
+                    auto drop_oldest_non_note_off = [&]() -> bool {
+                        const auto it = std::find_if(
+                            worker.output_queue.begin(),
+                            worker.output_queue.end(),
+                            [](const OutboundItem& item) { return !is_note_off_message(item.bytes); });
+                        if (it == worker.output_queue.end()) {
+                            return false;
+                        }
+                        worker.output_queue.erase(it);
+                        ++worker.output_dropped_events;
+                        log_overflow("drop-oldest-non-note-off");
+                        return true;
+                    };
+
+                    if (incoming_is_note_off) {
+                        if (!drop_oldest_non_note_off()) {
+                            worker.output_queue.pop_front();
+                            ++worker.output_dropped_events;
+                            log_overflow("drop-oldest");
+                        }
+                    } else {
+                        if (!drop_oldest_non_note_off()) {
+                            ++worker.output_dropped_events;
+                            log_overflow("drop-incoming-preserve-note-off");
+                            error = "output queue overflow (preserving queued Note Off events)";
+                            return false;
+                        }
                     }
                 }
 
@@ -177,6 +235,151 @@ struct IoLoop::Impl {
 
         error = "no module route for global_port=" + std::to_string(global_port);
         return false;
+    }
+
+    bool upsert_route(MidiRouteConfig route, std::string& error) {
+        if (route.id.empty()) {
+            error = "route.id must not be empty";
+            return false;
+        }
+        if (route.midi_in_channel < 0 || route.midi_in_channel > 16) {
+            error = "route.midi_in_channel must be in range 0..16";
+            return false;
+        }
+        if (route.midi_out_channel < 1 || route.midi_out_channel > 16) {
+            error = "route.midi_out_channel must be in range 1..16";
+            return false;
+        }
+        if (route.enabled && route.midi_out_port <= 0) {
+            error = "route.midi_out_port must be > 0 when route is enabled";
+            return false;
+        }
+
+        std::size_t route_count = 0;
+        std::string active_id;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            routes_by_id[route.id] = route;
+            if (active_route_id.empty()) {
+                active_route_id = route.id;
+            }
+            route_count = routes_by_id.size();
+            active_id = active_route_id;
+        }
+        spdlog::debug(
+            "routing upsert id={} in_port={} in_ch={} out_port={} out_ch={} enabled={} route_count={} active={}",
+            route.id,
+            route.midi_in_port,
+            route.midi_in_channel,
+            route.midi_out_port,
+            route.midi_out_channel,
+            route.enabled,
+            route_count,
+            active_id);
+        return true;
+    }
+
+    bool remove_route(const std::string& route_id, std::string& error) {
+        if (route_id.empty()) {
+            error = "route_id must not be empty";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        const auto erased = routes_by_id.erase(route_id);
+        if (erased == 0) {
+            error = "unknown route_id: " + route_id;
+            return false;
+        }
+        if (active_route_id == route_id) {
+            active_route_id.clear();
+        }
+        return true;
+    }
+
+    bool set_active_route(std::string route_id, std::string& error) {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+
+        // Empty id explicitly disables active routing.
+        if (route_id.empty()) {
+            active_route_id.clear();
+            return true;
+        }
+
+        if (routes_by_id.find(route_id) == routes_by_id.end()) {
+            error = "unknown route_id: " + route_id;
+            return false;
+        }
+
+        active_route_id = std::move(route_id);
+        return true;
+    }
+
+    void apply_active_route(const MidiPacket& packet) {
+        MidiRouteConfig route;
+        bool have_route = false;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            if (!active_route_id.empty()) {
+                const auto it = routes_by_id.find(active_route_id);
+                if (it != routes_by_id.end() && it->second.enabled) {
+                    route = it->second;
+                    have_route = true;
+                }
+            }
+        }
+        if (!have_route) {
+            return;
+        }
+
+        if (route.midi_out_port <= 0) {
+            return;
+        }
+        if (route.midi_in_port > 0 && static_cast<int>(packet.global_port) != route.midi_in_port) {
+            return;
+        }
+        if (packet.bytes.empty()) {
+            return;
+        }
+
+        const std::uint8_t status = packet.bytes[0];
+        const int in_channel = midi_channel_from_status(status);
+        if (route.midi_in_channel > 0 && in_channel != route.midi_in_channel) {
+            return;
+        }
+
+        std::vector<std::uint8_t> out_bytes = packet.bytes;
+        if (is_channel_message(status)) {
+            out_bytes[0] =
+                static_cast<std::uint8_t>((status & 0xF0U) | static_cast<std::uint8_t>((route.midi_out_channel - 1) & 0x0FU));
+        }
+
+        std::string send_error;
+        if (enqueue_output(static_cast<std::size_t>(route.midi_out_port), out_bytes, send_error)) {
+            const auto forwarded = route_forwarded_events_total.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (forwarded <= 20 || (forwarded % 200) == 0) {
+                spdlog::debug(
+                    "routing fwd id={} in_port={} out_port={} in_ch={} out_ch={} bytes={} forwarded={}",
+                    route.id,
+                    packet.global_port,
+                    route.midi_out_port,
+                    in_channel,
+                    route.midi_out_channel,
+                    out_bytes.size(),
+                    forwarded);
+            }
+        } else {
+            const auto dropped = route_dropped_events_total.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (dropped <= 20 || (dropped % 200) == 0) {
+                spdlog::warn(
+                    "routing drop id={} in_port={} out_port={} err={} dropped={}",
+                    route.id,
+                    packet.global_port,
+                    route.midi_out_port,
+                    send_error,
+                    dropped);
+            }
+        }
     }
 
     void start_bus_worker(BusWorker& worker) {
@@ -219,6 +422,7 @@ struct IoLoop::Impl {
                         .sequence = sequence,
                     };
 
+                    apply_active_route(packet);
                     {
                         std::lock_guard<std::mutex> lock(queue_mutex);
                         if (worker.queue_capacity > 0 && worker.queue.size() >= worker.queue_capacity) {
@@ -243,55 +447,95 @@ struct IoLoop::Impl {
             }
 
             for (;;) {
-                OutboundItem outbound;
-                bool have_outbound = false;
+                std::vector<OutboundItem> outbound_batch;
                 {
                     std::lock_guard<std::mutex> lock(queue_mutex);
                     if (!worker.output_queue.empty()) {
-                        outbound = std::move(worker.output_queue.front());
+                        outbound_batch.push_back(std::move(worker.output_queue.front()));
                         worker.output_queue.pop_front();
-                        have_outbound = true;
+
+                        const auto module_index = outbound_batch.front().module_index;
+                        std::size_t batch_limit = 1;
+                        if (module_index < worker.modules.size()) {
+                            const auto frame_size =
+                                std::max<std::size_t>(worker.modules[module_index].max_frame_bytes, 24);
+                            const auto max_batch = frame_size > 17 ? ((frame_size - 17) / 5) : 0;
+                            batch_limit = std::max<std::size_t>(max_batch, 1);
+                        }
+
+                        while (!worker.output_queue.empty() && outbound_batch.size() < batch_limit) {
+                            if (worker.output_queue.front().module_index != module_index) {
+                                break;
+                            }
+                            outbound_batch.push_back(std::move(worker.output_queue.front()));
+                            worker.output_queue.pop_front();
+                        }
                     }
                 }
 
-                if (have_outbound) {
+                if (!outbound_batch.empty()) {
+                    const auto module_index = outbound_batch.front().module_index;
+                    const auto seq_first = outbound_batch.front().sequence;
+                    const auto seq_last = outbound_batch.back().sequence;
+                    std::size_t total_midi_bytes = 0;
+                    for (const auto& item : outbound_batch) {
+                        total_midi_bytes += item.bytes.size();
+                    }
+
                     bool sent = false;
-                    if (outbound.module_index < worker.modules.size()) {
-                        const auto& module = worker.modules[outbound.module_index];
-                        sent = worker.spi.write_packet(module, outbound.local_port, outbound.bytes);
+                    if (module_index < worker.modules.size()) {
+                        const auto& module = worker.modules[module_index];
+                        std::vector<SpiTxEvent> spi_events;
+                        spi_events.reserve(outbound_batch.size());
+                        std::size_t first_global_port = outbound_batch.front().global_port;
+                        std::size_t last_global_port = outbound_batch.back().global_port;
+                        for (const auto& item : outbound_batch) {
+                            spi_events.push_back(SpiTxEvent {
+                                .local_port = item.local_port,
+                                .bytes = item.bytes,
+                            });
+                        }
+
+                        sent = worker.spi.write_packets(module, spi_events);
                         if (!sent) {
                             spdlog::warn(
-                                "spi tx failed bus={} module={} global_port={} local_port={} bytes={} seq={}",
+                                "spi tx failed bus={} module={} global_port={}..{} events={} midi_bytes={} seq={}..{}",
                                 worker.bus_key,
                                 module.id,
-                                outbound.global_port,
-                                outbound.local_port,
-                                outbound.bytes.size(),
-                                outbound.sequence);
+                                first_global_port,
+                                last_global_port,
+                                outbound_batch.size(),
+                                total_midi_bytes,
+                                seq_first,
+                                seq_last);
                         } else {
                             spdlog::debug(
-                                "spi tx bus={} module={} global_port={} local_port={} bytes={} seq={}",
+                                "spi tx bus={} module={} global_port={}..{} events={} midi_bytes={} seq={}..{}",
                                 worker.bus_key,
                                 module.id,
-                                outbound.global_port,
-                                outbound.local_port,
-                                outbound.bytes.size(),
-                                outbound.sequence);
+                                first_global_port,
+                                last_global_port,
+                                outbound_batch.size(),
+                                total_midi_bytes,
+                                seq_first,
+                                seq_last);
                         }
                     } else {
                         spdlog::warn(
-                            "spi tx failed bus={} invalid module index={} seq={}",
+                            "spi tx failed bus={} invalid module index={} events={} seq={}..{}",
                             worker.bus_key,
-                            outbound.module_index,
-                            outbound.sequence);
+                            module_index,
+                            outbound_batch.size(),
+                            seq_first,
+                            seq_last);
                     }
 
                     {
                         std::lock_guard<std::mutex> lock(queue_mutex);
                         if (sent) {
-                            ++worker.output_sent_events;
+                            worker.output_sent_events += outbound_batch.size();
                         } else {
-                            ++worker.output_failed_events;
+                            worker.output_failed_events += outbound_batch.size();
                         }
                     }
                     continue;
@@ -302,7 +546,7 @@ struct IoLoop::Impl {
                 }
 
                 worker.gpio.run_once();
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         });
     }
@@ -499,6 +743,7 @@ struct IoLoop::Impl {
     }
 
     void enqueue(MidiPacket packet) {
+        apply_active_route(packet);
         enqueue_locked(std::move(packet), usb_queue, usb_queue_high_watermark, usb_dropped_events);
         queue_cv.notify_one();
     }
@@ -513,6 +758,10 @@ struct IoLoop::Impl {
         IoMetrics metrics;
         metrics.queue_capacity_per_bus = config.queue.max_events_per_bus;
         metrics.warning_threshold_percent = config.queue.warning_threshold_percent;
+        metrics.route_count = routes_by_id.size();
+        metrics.active_route_id = active_route_id;
+        metrics.route_forwarded_events_total = route_forwarded_events_total.load(std::memory_order_relaxed);
+        metrics.route_dropped_events_total = route_dropped_events_total.load(std::memory_order_relaxed);
         metrics.dropped_events_total += usb_dropped_events;
         if (!config.usb_midi_controllers.empty()) {
             metrics.buses.push_back(BusIoMetrics {
@@ -568,6 +817,10 @@ struct IoLoop::Impl {
     std::deque<PublishedItem> usb_queue;
     std::size_t usb_queue_high_watermark {0};
     std::uint64_t usb_dropped_events {0};
+    std::unordered_map<std::string, MidiRouteConfig> routes_by_id;
+    std::string active_route_id;
+    std::atomic<std::uint64_t> route_forwarded_events_total {0};
+    std::atomic<std::uint64_t> route_dropped_events_total {0};
     std::thread publisher;
 };
 
@@ -607,6 +860,30 @@ bool IoLoop::send_midi(std::size_t global_port, std::vector<std::uint8_t> bytes,
         return false;
     }
     return impl_->send_midi(global_port, std::move(bytes), error);
+}
+
+bool IoLoop::upsert_route(MidiRouteConfig route, std::string& error) {
+    if (!impl_) {
+        error = "io loop not initialized";
+        return false;
+    }
+    return impl_->upsert_route(std::move(route), error);
+}
+
+bool IoLoop::remove_route(const std::string& route_id, std::string& error) {
+    if (!impl_) {
+        error = "io loop not initialized";
+        return false;
+    }
+    return impl_->remove_route(route_id, error);
+}
+
+bool IoLoop::set_active_route(std::string route_id, std::string& error) {
+    if (!impl_) {
+        error = "io loop not initialized";
+        return false;
+    }
+    return impl_->set_active_route(std::move(route_id), error);
 }
 
 IoMetrics IoLoop::snapshot() const {

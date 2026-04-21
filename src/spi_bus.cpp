@@ -61,6 +61,84 @@ struct InvalidPortStats {
     std::uint64_t count {0};
     std::chrono::steady_clock::time_point last_log {};
 };
+
+struct CachedSpiFd {
+    int fd {-1};
+    std::uint8_t mode {0};
+    std::uint8_t bits_per_word {8};
+    std::uint32_t speed_hz {0};
+    bool configured {false};
+
+    ~CachedSpiFd() {
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+    }
+};
+
+using SpiFdCache = std::unordered_map<std::string, CachedSpiFd>;
+
+SpiFdCache& thread_spi_fd_cache() {
+    static thread_local SpiFdCache cache;
+    return cache;
+}
+
+void invalidate_cached_spi_fd(const std::string& spi_device) {
+    auto& cache = thread_spi_fd_cache();
+    const auto it = cache.find(spi_device);
+    if (it == cache.end()) {
+        return;
+    }
+    if (it->second.fd >= 0) {
+        ::close(it->second.fd);
+    }
+    cache.erase(it);
+}
+
+bool acquire_cached_spi_fd(const ModuleConfig& module,
+                           const std::uint8_t mode,
+                           const std::uint8_t bits_per_word,
+                           const std::uint32_t speed_hz,
+                           int& fd_out) {
+    auto& cache = thread_spi_fd_cache();
+    auto& handle = cache[module.spi_device];
+
+    if (handle.fd < 0) {
+        handle.fd = ::open(module.spi_device.c_str(), O_RDWR);
+        if (handle.fd < 0) {
+            spdlog::warn("failed to open SPI device {}: {}", module.spi_device, std::strerror(errno));
+            return false;
+        }
+        handle.configured = false;
+    }
+
+    if (!handle.configured || handle.mode != mode || handle.bits_per_word != bits_per_word || handle.speed_hz != speed_hz) {
+        if (::ioctl(handle.fd, SPI_IOC_WR_MODE, &mode) < 0 ||
+            ::ioctl(handle.fd, SPI_IOC_WR_BITS_PER_WORD, &bits_per_word) < 0 ||
+            ::ioctl(handle.fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed_hz) < 0) {
+            spdlog::debug(
+                "spi cfg failed dev={} mode={} bits={} speed_hz={} err={}",
+                module.spi_device,
+                static_cast<int>(mode),
+                static_cast<int>(bits_per_word),
+                speed_hz,
+                std::strerror(errno));
+            spdlog::warn("failed to configure SPI device {}: {}", module.spi_device, std::strerror(errno));
+            invalidate_cached_spi_fd(module.spi_device);
+            return false;
+        }
+
+        handle.mode = mode;
+        handle.bits_per_word = bits_per_word;
+        handle.speed_hz = speed_hz;
+        handle.configured = true;
+    }
+
+    fd_out = handle.fd;
+    return true;
+}
+
 SpiReadResult decode_payload(std::vector<std::uint8_t> payload) {
     if (payload.empty()) {
         return {};
@@ -241,14 +319,6 @@ bool transfer_frame(const ModuleConfig& module, const std::vector<std::uint8_t>&
         return false;
     }
 
-    const int fd = ::open(module.spi_device.c_str(), O_RDWR);
-    if (fd < 0) {
-        spdlog::warn("failed to open SPI device {}: {}", module.spi_device, std::strerror(errno));
-        return false;
-    }
-
-    const auto close_fd = [&]() { ::close(fd); };
-
     std::uint8_t mode = module.spi_mode;
     if (module.chip_select_gpio >= 0) {
         mode |= SPI_NO_CS;
@@ -256,18 +326,8 @@ bool transfer_frame(const ModuleConfig& module, const std::vector<std::uint8_t>&
     std::uint8_t bits_per_word = 8;
     std::uint32_t speed = module.spi_speed_hz;
 
-    if (::ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0 ||
-        ::ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits_per_word) < 0 ||
-        ::ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
-        spdlog::debug(
-            "spi cfg failed dev={} mode={} bits={} speed_hz={} err={}",
-            module.spi_device,
-            static_cast<int>(mode),
-            static_cast<int>(bits_per_word),
-            speed,
-            std::strerror(errno));
-        spdlog::warn("failed to configure SPI device {}: {}", module.spi_device, std::strerror(errno));
-        close_fd();
+    int fd = -1;
+    if (!acquire_cached_spi_fd(module, mode, bits_per_word, speed, fd)) {
         return false;
     }
 
@@ -280,16 +340,15 @@ bool transfer_frame(const ModuleConfig& module, const std::vector<std::uint8_t>&
 
     if (!chip_select.set_asserted(true)) {
         spdlog::warn("failed to assert chip-select GPIO {}", module.chip_select_gpio);
-        close_fd();
         return false;
     }
 
     const int result = ::ioctl(fd, SPI_IOC_MESSAGE(1), &transfer);
     (void)chip_select.set_asserted(false);
-    close_fd();
 
     if (result < 0) {
         spdlog::warn("SPI transfer failed on {}: {}", module.spi_device, std::strerror(errno));
+        invalidate_cached_spi_fd(module.spi_device);
         return false;
     }
     return true;
@@ -361,28 +420,65 @@ SpiReadResult SpiBus::read_packet(const ModuleConfig& module) {
 }
 
 bool SpiBus::write_packet(const ModuleConfig& module, std::size_t local_port, const std::vector<std::uint8_t>& bytes) {
+    std::vector<SpiTxEvent> events;
+    events.push_back(SpiTxEvent {.local_port = local_port, .bytes = bytes});
+    return write_packets(module, events);
+}
+
+bool SpiBus::write_packets(const ModuleConfig& module, const std::vector<SpiTxEvent>& events) {
 #if defined(__linux__)
-    if (bytes.empty() || bytes.size() > 3) {
-        spdlog::warn(
-            "spi tx invalid midi bytes size module={} local_port={} bytes={}",
-            module.id,
-            local_port,
-            bytes.size());
-        return false;
+    if (events.empty()) {
+        return true;
     }
 
-    if ((bytes[0] & 0x80) == 0) {
-        spdlog::warn(
-            "spi tx invalid status module={} local_port={} status=0x{:02X}",
-            module.id,
-            local_port,
-            static_cast<unsigned int>(bytes[0]));
-        return false;
+    for (const auto& event : events) {
+        if (event.bytes.empty() || event.bytes.size() > 3) {
+            spdlog::warn(
+                "spi tx invalid midi bytes size module={} local_port={} bytes={}",
+                module.id,
+                event.local_port,
+                event.bytes.size());
+            return false;
+        }
+        if ((event.bytes[0] & 0x80) == 0) {
+            spdlog::warn(
+                "spi tx invalid status module={} local_port={} status=0x{:02X}",
+                module.id,
+                event.local_port,
+                static_cast<unsigned int>(event.bytes[0]));
+            return false;
+        }
     }
 
     constexpr std::size_t kPacketSize = 24;
-    constexpr std::uint32_t kMagic = 0x4D494449u; // "MIDI"
+    constexpr std::uint32_t kMagicSingle = 0x4D494449u;  // "MIDI"
+    constexpr std::uint32_t kMagicBatch = 0x4D494442u;   // "MIDB"
+    constexpr std::size_t kBatchHeaderSize = 17;         // magic+seq+ts+count
+    constexpr std::size_t kBatchEventSize = 5;           // local_port,size,status,data1,data2
     const std::size_t frame_size = std::max<std::size_t>(module.max_frame_bytes, kPacketSize);
+
+    const auto max_batch_events = (frame_size > kBatchHeaderSize)
+                                      ? ((frame_size - kBatchHeaderSize) / kBatchEventSize)
+                                      : 0;
+    if (max_batch_events == 0) {
+        spdlog::warn(
+            "spi tx frame too small for batch module={} frame_bytes={} required>{}",
+            module.id,
+            frame_size,
+            kBatchHeaderSize);
+        return false;
+    }
+
+    if (events.size() > max_batch_events) {
+        spdlog::warn(
+            "spi tx batch too large module={} events={} max_events={}",
+            module.id,
+            events.size(),
+            max_batch_events);
+        return false;
+    }
+
+    const auto event_count = events.size();
 
     std::vector<std::uint8_t> tx(frame_size, 0x00);
     std::vector<std::uint8_t> rx(frame_size, 0x00);
@@ -407,38 +503,60 @@ bool SpiBus::write_packet(const ModuleConfig& module, std::size_t local_port, co
 
     static std::atomic<std::uint32_t> tx_sequence {0};
     const auto sequence = tx_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-
-    write_u32_le(0, kMagic);
-    write_u32_le(4, sequence);
-
     const auto now_us = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
-    write_u64_le(8, now_us);
 
-    tx[16] = static_cast<std::uint8_t>(bytes.size());
-    tx[17] = bytes[0];
-    if (bytes.size() > 1) {
-        tx[18] = bytes[1];
-    }
-    if (bytes.size() > 2) {
-        tx[19] = bytes[2];
-    }
-    // Keep local_port in reserved byte for forward compatibility.
-    tx[20] = static_cast<std::uint8_t>(local_port & 0xFFU);
+    if (event_count == 1) {
+        const auto& event = events.front();
+        write_u32_le(0, kMagicSingle);
+        write_u32_le(4, sequence);
+        write_u64_le(8, now_us);
+        tx[16] = static_cast<std::uint8_t>(event.bytes.size());
+        tx[17] = event.bytes[0];
+        if (event.bytes.size() > 1) {
+            tx[18] = event.bytes[1];
+        }
+        if (event.bytes.size() > 2) {
+            tx[19] = event.bytes[2];
+        }
+        tx[20] = static_cast<std::uint8_t>(event.local_port & 0xFFU);
 
-    spdlog::trace(
-        "spi tx module={} local_port={} frame_bytes={} midi=[{}]",
-        module.id,
-        local_port,
-        tx.size(),
-        hex_dump(bytes));
+        spdlog::trace(
+            "spi tx module={} local_port={} frame_bytes={} midi=[{}]",
+            module.id,
+            event.local_port,
+            tx.size(),
+            hex_dump(event.bytes));
+    } else {
+        write_u32_le(0, kMagicBatch);
+        write_u32_le(4, sequence);
+        write_u64_le(8, now_us);
+        tx[16] = static_cast<std::uint8_t>(event_count & 0xFFU);
+
+        std::size_t offset = kBatchHeaderSize;
+        for (std::size_t i = 0; i < event_count; ++i) {
+            const auto& event = events[i];
+            tx[offset + 0] = static_cast<std::uint8_t>(event.local_port & 0xFFU);
+            tx[offset + 1] = static_cast<std::uint8_t>(event.bytes.size() & 0xFFU);
+            tx[offset + 2] = event.bytes[0];
+            tx[offset + 3] = event.bytes.size() > 1 ? event.bytes[1] : 0x00;
+            tx[offset + 4] = event.bytes.size() > 2 ? event.bytes[2] : 0x00;
+            offset += kBatchEventSize;
+        }
+
+        spdlog::trace(
+            "spi tx batch module={} events={} frame_bytes={}",
+            module.id,
+            event_count,
+            tx.size());
+    }
+
     return transfer_frame(module, tx, rx);
 #else
     (void)module;
-    (void)local_port;
-    (void)bytes;
+    (void)events;
     return true;
 #endif
 }
