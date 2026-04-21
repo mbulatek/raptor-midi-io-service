@@ -274,6 +274,8 @@ std::string render_reply(const ControlRequest& request,
                             {"midi_port_total", midi_port_total},
                             {"published_packets", snapshot.published_packets},
                             {"events_endpoint", snapshot.events_endpoint},
+                            {"realtime_events_endpoint", snapshot.realtime_events_endpoint},
+                            {"playback_endpoint", snapshot.playback_endpoint},
                             {"control_endpoint", snapshot.control_endpoint},
                             {"service_name", snapshot.service_name},
                             {"modules", std::move(modules)},
@@ -326,6 +328,8 @@ ControlServer::ControlServer(
       impl_(std::make_unique<Impl>()) {
     snapshot_.module_count = config.modules.size();
     snapshot_.events_endpoint = config.ipc.events_endpoint;
+    snapshot_.realtime_events_endpoint = config.ipc.realtime_events_endpoint;
+    snapshot_.playback_endpoint = config.ipc.playback_endpoint;
     snapshot_.control_endpoint = config.ipc.control_endpoint;
 
 #if RAPTOR_MIDI_IO_HAS_ZEROMQ
@@ -385,26 +389,26 @@ void ControlServer::set_snapshot(ServiceSnapshot snapshot) {
     snapshot_ = std::move(snapshot);
 }
 
-void ControlServer::poll_once() {
+bool ControlServer::poll_once() {
 #if RAPTOR_MIDI_IO_HAS_ZEROMQ
     if (!(impl_ && impl_->router != nullptr && config_ != nullptr)) {
-        return;
+        return false;
     }
 
     zmq_pollitem_t items[] = {{impl_->router, 0, ZMQ_POLLIN, 0}};
     if (zmq_poll(items, 1, 0) <= 0 || (items[0].revents & ZMQ_POLLIN) == 0) {
-        return;
+        return false;
     }
 
     zmq_msg_t identity;
     zmq_msg_init(&identity);
     if (zmq_msg_recv(&identity, impl_->router, 0) < 0) {
         zmq_msg_close(&identity);
-        return;
+        return false;
     }
     if (zmq_msg_more(&identity) == 0) {
         zmq_msg_close(&identity);
-        return;
+        return false;
     }
 
     zmq_msg_t command_msg;
@@ -412,7 +416,7 @@ void ControlServer::poll_once() {
     if (zmq_msg_recv(&command_msg, impl_->router, 0) < 0) {
         zmq_msg_close(&identity);
         zmq_msg_close(&command_msg);
-        return;
+        return false;
     }
 
     // ROUTER can receive:
@@ -425,7 +429,7 @@ void ControlServer::poll_once() {
         if (zmq_msg_recv(&command_msg, impl_->router, 0) < 0) {
             zmq_msg_close(&identity);
             zmq_msg_close(&command_msg);
-            return;
+            return false;
         }
     }
 
@@ -654,7 +658,9 @@ void ControlServer::poll_once() {
 
     zmq_msg_close(&identity);
     zmq_msg_close(&command_msg);
+    return true;
 #endif
+    return false;
 }
 
 }  // namespace raptor::midi_io

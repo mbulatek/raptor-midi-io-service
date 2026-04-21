@@ -16,7 +16,10 @@ modules:
     chip_select_gpio: -1
     handshake_gpio: 23
     handshake_active_low: false
-    max_frame_bytes: 64
+    # ESP bridge uses fixed 96-byte slave transactions; keep host frame at least this size.
+    max_frame_bytes: 96
+    # Small TX spacing improves stability under dense MIDI bursts/chords.
+    tx_interframe_delay_us: 250
     midi_port_count: 2
 
   - id: esp-b
@@ -26,7 +29,8 @@ modules:
     chip_select_gpio: -1
     handshake_gpio: 24
     handshake_active_low: false
-    max_frame_bytes: 64
+    max_frame_bytes: 96
+    tx_interframe_delay_us: 250
     midi_port_count: 3
 
 usb_midi_controllers:

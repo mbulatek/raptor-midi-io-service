@@ -177,7 +177,9 @@ struct UsbMidiInput::Impl {
 
         while (!stop_requested.load(std::memory_order_relaxed)) {
             snd_seq_event_t* event = nullptr;
+            bool drained_any = false;
             while (snd_seq_event_input(seq, &event) >= 0) {
+                drained_any = true;
                 if (event == nullptr) {
                     continue;
                 }
@@ -204,6 +206,10 @@ struct UsbMidiInput::Impl {
                 packet.module_last_global_port = it->global_port;
                 packet.local_port = 1;
                 packet.global_port = it->global_port;
+                packet.timestamp_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now().time_since_epoch())
+                        .count());
                 packet.bytes = bytes;
                 packet.sequence = sequence_counter.fetch_add(1, std::memory_order_relaxed) + 1;
 
@@ -211,7 +217,11 @@ struct UsbMidiInput::Impl {
                 callback(std::move(packet));
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (drained_any) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
     }
 
